@@ -1,0 +1,20 @@
+server:
+  port: ${SERVER_PORT:9090}
+
+spring:
+  application:
+    name: koawa-agent
+
+agent:
+  runtime:
+    max-steps: ${AGENT_MAX_STEPS:8}
+    turn-timeout: ${AGENT_TURN_TIMEOUT:120s}
+    allowed-tool-ids: ${AGENT_ALLOWED_TOOL_IDS:}
+  llm:
+    base-url: ${SILICONFLOW_BASE_URL:https://api.siliconflow.cn/v1}
+    api-key: ${SILICONFLOW_API_KEY:}
+    model: ${SILICONFLOW_CHAT_MODEL:Pro/zai-org/GLM-4.7}
+    request-timeout: ${LLM_REQUEST_TIMEOUT:60s}
+  mcp:
+    request-timeout: ${MCP_REQUEST_TIMEOUT:30s}
+    servers: []
