@@ -442,6 +442,249 @@ Add immutable agent task snapshot
 
 ---
 
+## 2026-07-24：Checkpoint Store 与乐观并发控制
+
+### 1. 本次目标
+
+定义 Runtime 依赖的 Checkpoint 存储端口，并实现线程安全的内存版本，固定首次写入、
+顺序更新、并发冲突、生命周期保护和查询语义。
+
+本切片仍未把 Store 接入 `AgentLoopRunner`，也没有实现 JDBC。
+
+### 2. 核心代码
+
+实现文件：
+
+- `agent/checkpoint/AgentCheckpointStore.java`
+- `agent/checkpoint/CheckpointConflictException.java`
+- `agent/checkpoint/InMemoryAgentCheckpointStore.java`
+- `agent/checkpoint/InMemoryAgentCheckpointStoreTest.java`
+
+存储端口：
+
+```java
+public interface AgentCheckpointStore {
+    long NO_REVISION = -1;
+
+    AgentTaskSnapshot save(
+            AgentTaskSnapshot snapshot,
+            long expectedRevision
+    );
+
+    Optional<AgentTaskSnapshot> load(String taskId);
+
+    List<AgentTaskSnapshot> list(String conversationId);
+
+    void delete(String taskId);
+}
+```
+
+首次保存协议：
+
+```text
+expectedRevision = -1
+snapshot.revision = 0
+```
+
+更新协议：
+
+```text
+数据库当前 revision = N
+expectedRevision    = N
+新 Snapshot revision = N + 1
+```
+
+### 3. 执行流程
+
+正常更新：
+
+```text
+load task revision 3
+        ↓
+生成 revision 4 Snapshot
+        ↓ save(expectedRevision = 3)
+原子比较当前 revision
+        ↓
+保存成功
+```
+
+并发更新：
+
+```text
+恢复请求 A ── load revision 3 ── save revision 4 ── 成功
+恢复请求 B ── load revision 3 ── save revision 4 ── revision conflict
+```
+
+第二个请求不能覆盖第一个请求已经推进的任务。
+
+### 4. 工程设计与取舍
+
+#### Runtime 依赖端口而不是数据库
+
+`AgentCheckpointStore` 是 Runtime 所需能力的抽象。Runtime 不需要知道底层使用：
+
+- `ConcurrentHashMap`
+- JDBC
+- Redis
+- 其他持久化服务
+
+后续更换存储实现时，不修改 Agent 执行逻辑。
+
+#### Store 不负责生成 revision
+
+调用方显式提交新 revision，并提供 `expectedRevision`：
+
+```java
+store.save(nextSnapshot, currentSnapshot.revision());
+```
+
+Store 只验证：
+
+```text
+当前版本等于 expectedRevision
+新版本等于 expectedRevision + 1
+```
+
+这样 Snapshot 在进入 Store 前已经完整确定，Store 不会静默修改不可变对象。
+
+#### 使用 `ConcurrentHashMap.compute`
+
+不能使用分离的读写：
+
+```java
+if (map.get(taskId).revision() == expectedRevision) {
+    map.put(taskId, snapshot);
+}
+```
+
+因为两个线程可能同时通过 `if`。内存实现使用：
+
+```java
+snapshots.compute(taskId, (id, current) -> {
+    validateRevision(snapshot, expectedRevision, current);
+    return snapshot;
+});
+```
+
+同一个 key 的读取、校验和写入构成一个原子操作。
+
+#### 任务身份不能在更新中改变
+
+以下字段在同一任务的 revision 之间保持不变：
+
+- `conversationId`
+- `userId`
+- `originalQuestion`
+- `createdAt`
+
+否则一次普通状态更新可能把任务移动到其他用户或对话，形成越权和审计问题。
+
+#### Store 再次保护生命周期迁移
+
+Snapshot 构造器只能验证单个对象内部是否一致，无法知道上一版本状态。Store 同时拥有：
+
+```text
+current Snapshot
+next Snapshot
+```
+
+因此由 Store 校验：
+
+```java
+current.status().canTransitionTo(next.status())
+```
+
+例如 `COMPLETED -> RUNNING` 会被拒绝。
+
+#### delete 不是正常完成流程
+
+正常完成只写入终态 Snapshot，并保留用于审计。`delete` 只用于管理员清理或数据保留
+策略，不由 AgentLoop 自动调用。
+
+### 5. 测试与验收结果
+
+覆盖内容：
+
+- 首次创建 revision 0
+- 正常从 revision 0 更新到 revision 1
+- 重复创建冲突
+- 过期 expectedRevision 冲突
+- 跳过 revision
+- 修改任务身份
+- 从终态恢复为运行态
+- 按 conversation 查询并按更新时间倒序
+- 显式删除
+- 两个线程竞争同一个 revision 时只有一个成功
+
+全量结果：
+
+```text
+tests=73
+failures=0
+errors=0
+skipped=0
+```
+
+### 6. 成熟框架对照
+
+Checkpoint Store 对应工作流 Runtime 的持久化端口，revision 对应数据库中的
+compare-and-set 或乐观锁版本。
+
+内存实现用于快速验证协议和并发语义，不承担跨进程恢复。后续 JDBC 实现必须保持相同
+接口和冲突行为，而不是让上层针对不同数据库编写不同恢复逻辑。
+
+### 7. 面试问题与参考回答
+
+#### 问题一：为什么需要乐观锁？
+
+参考回答：
+
+同一个暂停任务可能被两个 HTTP 请求同时恢复。如果没有乐观锁，后写入的请求会覆盖
+先写入的状态，导致工具重复执行或审批结果丢失。revision 让 Store 可以检测过期写入。
+
+#### 问题二：为什么不用 Java `synchronized`？
+
+参考回答：
+
+`synchronized` 只能保护当前 JVM。真实部署可能有多个应用实例，最终仍需要数据库条件
+更新或其他跨进程 compare-and-set。内存实现使用原子 Map 操作模拟同样的协议。
+
+#### 问题三：为什么检查和写入必须是一个原子操作？
+
+参考回答：
+
+如果先读取 revision、再单独写入，两个线程可能同时看到相同版本并都写入成功。原子
+compare-and-set 保证同一个 revision 只能有一个推进者。
+
+#### 问题四：为什么由 Store 校验状态迁移？
+
+参考回答：
+
+单个 Snapshot 只能验证自身字段。合法迁移需要同时查看上一版本和下一版本，而 Store
+正好在原子写入期间拥有两者，可以避免校验之后、写入之前状态被其他线程改变。
+
+#### 问题五：内存 Store 已经线程安全，为什么还需要 JDBC Store？
+
+参考回答：
+
+线程安全只解决同一个进程内的并发，不能解决应用重启、多个实例和长期审计。内存实现
+主要用于验证端口协议、单元测试和本地演示，跨重启恢复需要持久化实现。
+
+#### 问题六：悲观锁和乐观锁如何选择？
+
+参考回答：
+
+Agent Checkpoint 在一次 Step 完成后才写入，冲突通常较少，而且任务执行可能包含较慢
+的模型或工具调用，不适合长期持有数据库锁。因此采用短事务的乐观锁更合适。
+
+### 8. 对应提交
+
+```text
+Add optimistic in-memory checkpoint store
+```
+
+---
+
 ## 后续记录模板
 
 ### YYYY-MM-DD：切片名称

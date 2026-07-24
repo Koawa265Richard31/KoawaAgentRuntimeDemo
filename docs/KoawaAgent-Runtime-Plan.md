@@ -262,7 +262,10 @@ public interface AgentCheckpointStore {
 要求：
 
 - 使用 `revision` 做乐观并发控制。
+- 首次保存使用 `expectedRevision = -1` 和 `revision = 0`。
+- 更新时数据库当前版本必须等于 `expectedRevision`，新 Snapshot 必须是下一 revision。
 - 同一任务不能被两个恢复请求同时推进。
+- revision 更新时原子校验任务身份和生命周期迁移。
 - 每个 Step 完成后保存。
 - 进入等待状态前必须保存。
 - 终态 Snapshot 保留，用于审计，不能再次恢复。
