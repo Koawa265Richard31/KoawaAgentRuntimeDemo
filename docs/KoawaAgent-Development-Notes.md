@@ -685,6 +685,208 @@ Add optimistic in-memory checkpoint store
 
 ---
 
+## 2026-07-24：AgentState 与 Snapshot 双向映射
+
+### 1. 本次目标
+
+实现 `AgentTaskSnapshotMapper`，在可变运行时状态和不可变持久化状态之间进行完整转换：
+
+```text
+AgentState -> AgentTaskSnapshot -> new AgentState
+```
+
+Mapper 只负责确定性数据转换，不负责决定任务状态、revision 或保存时间。
+
+### 2. 核心代码
+
+实现文件：
+
+- `agent/checkpoint/AgentTaskSnapshotMapper.java`
+- `agent/checkpoint/AgentTaskSnapshotMappingException.java`
+- `agent/checkpoint/AgentTaskSnapshotMapperTest.java`
+
+保存方向：
+
+```java
+AgentTaskSnapshot snapshot = mapper.toSnapshot(
+        state,
+        status,
+        revision,
+        pendingInterrupt,
+        createdAt,
+        updatedAt
+);
+```
+
+恢复方向：
+
+```java
+AgentState restoredState = mapper.toState(snapshot);
+```
+
+### 3. 执行流程
+
+保存：
+
+```text
+AgentState
+  ├─ AgentStep -> StepSnapshot
+  ├─ ChatMessage -> MessageSnapshot
+  ├─ Map arguments -> JSON
+  ├─ Map metadata -> JSON
+  └─ 恢复字段 -> recoveryContext
+               ↓
+       AgentTaskSnapshot
+```
+
+恢复：
+
+```text
+AgentTaskSnapshot
+  ├─ StepSnapshot -> new AgentStep
+  ├─ MessageSnapshot -> new ChatMessage
+  ├─ arguments JSON -> new Map
+  ├─ metadata JSON -> new Map
+  └─ recoveryContext -> 运行结果和恢复次数
+               ↓
+          new AgentState
+```
+
+Snapshot 中的 `nextStep` 恢复为运行时 `currentStep`。
+
+### 4. 工程设计与取舍
+
+#### Mapper 不推断生命周期
+
+`AgentState` 中没有持久化任务状态，而且 `AgentStopReason` 不能可靠推断
+`AgentTaskStatus`。因此 `status` 由编排层显式传入：
+
+```java
+mapper.toSnapshot(state, AgentTaskStatus.WAITING_FOR_INPUT, ...);
+```
+
+同理，revision 和时间也由调用方提供，保证 Mapper 是可重复测试的纯转换组件。
+
+#### 保存和恢复都创建新对象
+
+保存时不会把 `AgentAction`、`AgentObservation` 或 `ChatMessage` 引用放入 Snapshot。
+恢复时也不会把 Snapshot 内部对象直接暴露给 AgentState。
+
+因此：
+
+```text
+修改原 AgentState       不影响 Snapshot
+修改恢复后的 AgentState 不影响 Snapshot
+再次恢复                得到干净的新对象
+```
+
+#### 只允许完整 Step 进入 Checkpoint
+
+Checkpoint 保存边界位于 Step 完成之后。以下对象会被拒绝：
+
+```text
+step.action == null
+step.observation == null
+action.type != observation.actionType
+```
+
+这样恢复时不会面对“动作已经计划但不知道是否执行”的模糊状态。未来工具执行幂等会使用
+独立的执行记录解决崩溃窗口。
+
+#### JSON 损坏在映射边界失败
+
+Snapshot 构造器只验证 JSON 字段非空，Mapper 在恢复时进一步解析为 JSON Object。
+损坏数据抛出 `AgentTaskSnapshotMappingException`，不会带着半恢复状态进入 AgentLoop。
+
+#### 第一版 recoveryContext 固定键
+
+当前往返字段：
+
+```text
+planningRecoveryAttempts
+finalAnswer
+stopReason
+failureType
+errorMessage
+```
+
+Mapper 使用集中定义的固定键，避免其他层随意拼写。字段稳定后应升级为类型化
+`RecoverySnapshot` 或 `TaskOutcome`。
+
+### 5. 测试与验收结果
+
+覆盖内容：
+
+- 完整运行态往返不丢字段
+- Snapshot 与原 AgentState 深度隔离
+- 多次恢复得到不同运行时对象
+- 不完整 Step 被拒绝
+- Action/Observation 类型不一致被拒绝
+- 损坏 Step JSON 被拒绝
+- 非法 recoveryContext 被拒绝
+
+全量结果：
+
+```text
+tests=78
+failures=0
+errors=0
+skipped=0
+```
+
+### 6. 成熟框架对照
+
+Mapper 是 Runtime Model 与 Persistence Model 之间的反腐层。它避免持久化结构侵入
+AgentLoop，也避免数据库或 JSON 细节泄漏到 Planner、Executor。
+
+后续无论 Store 使用内存还是 JDBC，都只处理 `AgentTaskSnapshot`；AgentLoop 仍只处理
+`AgentState`。
+
+### 7. 面试问题与参考回答
+
+#### 问题一：为什么不让 `AgentState` 直接实现序列化？
+
+参考回答：
+
+运行时模型为了执行方便是可变的，并且以后可能加入运行时依赖。独立 Mapper 可以明确
+控制持久化字段、深拷贝规则和兼容逻辑，避免持久化协议被运行时代码结构绑死。
+
+#### 问题二：为什么 Mapper 不根据 stopReason 推断 taskStatus？
+
+参考回答：
+
+一次循环停止不等于整个任务结束。例如 `ASK_CLARIFICATION` 应映射为可恢复的等待状态。
+生命周期属于编排决策，隐式推断容易把暂停错误地写成终态。
+
+#### 问题三：如何证明快照是真正隔离的？
+
+参考回答：
+
+测试在创建 Snapshot 后修改原 Action 参数、Observation metadata 和历史消息，再验证
+恢复结果不变；随后修改恢复对象并再次恢复，验证第二次恢复仍然得到原始数据。
+
+#### 问题四：为什么不保存执行到一半的 Step？
+
+参考回答：
+
+中间状态无法判断工具到底有没有产生副作用，恢复时容易重复执行。第一版只在完整 Step
+边界保存，把语义控制为“前面全部完成，从 nextStep 继续”。
+
+#### 问题五：为什么需要专用 MappingException？
+
+参考回答：
+
+它把持久化数据损坏与普通 Agent 执行失败区分开。上层可以针对 Checkpoint 损坏报警、
+隔离任务或执行迁移，而不是让它被误判成模型或工具调用失败。
+
+### 8. 对应提交
+
+```text
+Add agent task snapshot mapper
+```
+
+---
+
 ## 后续记录模板
 
 ### YYYY-MM-DD：切片名称
