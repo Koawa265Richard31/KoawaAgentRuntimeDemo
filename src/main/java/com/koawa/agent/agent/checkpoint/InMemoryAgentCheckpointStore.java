@@ -29,16 +29,12 @@ public final class InMemoryAgentCheckpointStore
             long expectedRevision
     ) {
         Objects.requireNonNull(snapshot, "snapshot cannot be null");
-        if (expectedRevision < NO_REVISION) {
-            throw new IllegalArgumentException(
-                    "expectedRevision cannot be less than " + NO_REVISION);
-        }
 
         snapshots.compute(snapshot.taskId(), (taskId, current) -> {
-            validateRevision(snapshot, expectedRevision, current);
-            if (current != null) {
-                validateUpdate(current, snapshot);
-            }
+            CheckpointWriteValidator.validate(
+                    snapshot,
+                    expectedRevision,
+                    current);
             return snapshot;
         });
         return snapshot;
@@ -64,72 +60,6 @@ public final class InMemoryAgentCheckpointStore
     @Override
     public void delete(String taskId) {
         snapshots.remove(requireText(taskId, "taskId"));
-    }
-
-    private void validateRevision(
-            AgentTaskSnapshot next,
-            long expectedRevision,
-            AgentTaskSnapshot current
-    ) {
-        if (current == null) {
-            if (expectedRevision != NO_REVISION) {
-                throw conflict(next.taskId(), expectedRevision, null);
-            }
-            if (next.revision() != 0) {
-                throw new IllegalArgumentException(
-                        "a new checkpoint must start at revision 0");
-            }
-            return;
-        }
-
-        if (current.revision() != expectedRevision) {
-            throw conflict(
-                    next.taskId(),
-                    expectedRevision,
-                    current.revision());
-        }
-        if (expectedRevision == Long.MAX_VALUE
-                || next.revision() != expectedRevision + 1) {
-            throw new IllegalArgumentException(
-                    "an updated checkpoint must advance revision by exactly one");
-        }
-    }
-
-    private void validateUpdate(
-            AgentTaskSnapshot current,
-            AgentTaskSnapshot next
-    ) {
-        if (!current.conversationId().equals(next.conversationId())
-                || !Objects.equals(current.userId(), next.userId())
-                || !current.originalQuestion().equals(next.originalQuestion())
-                || !current.createdAt().equals(next.createdAt())) {
-            throw new IllegalArgumentException(
-                    "checkpoint task identity cannot change");
-        }
-        if (!current.status().canTransitionTo(next.status())) {
-            throw new IllegalStateException(
-                    "illegal checkpoint status transition: "
-                            + current.status() + " -> " + next.status());
-        }
-        if (next.updatedAt().isBefore(current.updatedAt())) {
-            throw new IllegalArgumentException(
-                    "checkpoint updatedAt cannot move backwards");
-        }
-        if (next.schemaVersion() < current.schemaVersion()) {
-            throw new IllegalArgumentException(
-                    "checkpoint schemaVersion cannot move backwards");
-        }
-    }
-
-    private CheckpointConflictException conflict(
-            String taskId,
-            long expectedRevision,
-            Long actualRevision
-    ) {
-        return new CheckpointConflictException(
-                taskId,
-                expectedRevision,
-                actualRevision);
     }
 
     private String requireText(String value, String fieldName) {

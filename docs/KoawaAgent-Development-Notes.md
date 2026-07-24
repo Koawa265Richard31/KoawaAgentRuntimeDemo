@@ -1298,6 +1298,256 @@ Add versioned checkpoint JSON codec
 
 ---
 
+## 2026-07-24：JDBC Checkpoint 持久化
+
+### 1. 本次目标
+
+将 Snapshot 从进程内 Map 扩展到真实关系数据库，提供 PostgreSQL 运行配置、Flyway
+迁移、JDBC Store，以及基于 H2 的真实 SQL 集成测试。
+
+当前 `AgentCheckpointService` 已默认装配 JDBC Store，但 AgentLoop 尚未调用该 Service。
+
+### 2. 核心代码
+
+实现文件：
+
+- `agent/checkpoint/JdbcAgentCheckpointStore.java`
+- `agent/checkpoint/CheckpointWriteValidator.java`
+- `agent/checkpoint/CorruptedCheckpointException.java`
+- `agent/checkpoint/AgentCheckpointConfiguration.java`
+- `db/migration/V1__create_agent_checkpoint.sql`
+- `agent/checkpoint/JdbcAgentCheckpointStoreTest.java`
+- `compose.yaml`
+
+表结构：
+
+```sql
+CREATE TABLE agent_checkpoint (
+    task_id VARCHAR(128) PRIMARY KEY,
+    conversation_id VARCHAR(128) NOT NULL,
+    user_id VARCHAR(128),
+    revision BIGINT NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    schema_version INTEGER NOT NULL,
+    snapshot_json TEXT NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL
+);
+```
+
+### 3. 执行流程
+
+首次创建：
+
+```text
+Snapshot revision 0
+       ↓ Codec.encode
+Snapshot JSON
+       ↓ INSERT
+agent_checkpoint
+```
+
+更新：
+
+```sql
+UPDATE agent_checkpoint
+SET revision = ?,
+    status = ?,
+    snapshot_json = ?,
+    updated_at = ?
+WHERE task_id = ?
+  AND revision = ?;
+```
+
+```text
+updatedRows = 1：保存成功
+updatedRows = 0：revision 冲突
+```
+
+读取：
+
+```text
+SELECT row
+   ↓ decode snapshot_json
+AgentTaskSnapshot
+   ↓ 对照索引列
+一致：返回 Snapshot
+不一致：CorruptedCheckpointException
+```
+
+### 4. 工程设计与取舍
+
+#### 索引列与 JSON 分工
+
+普通列保存：
+
+- taskId
+- conversationId
+- userId
+- revision
+- status
+- schemaVersion
+- createdAt
+- updatedAt
+
+这些字段用于索引、排序、过滤和 CAS 更新。
+
+`snapshot_json` 保存恢复所需的完整状态，避免第一版把 Step、消息和中断过度拆表。
+
+#### INSERT 与 UPDATE 分开
+
+新任务要求：
+
+```text
+expectedRevision = -1
+revision = 0
+```
+
+使用 INSERT。主键重复被转换为 `CheckpointConflictException`。
+
+已有任务使用带 revision 条件的 UPDATE，不采用“先判断再普通 UPDATE”。
+
+#### 共享写入校验
+
+原本校验只存在于 InMemory Store。现在提取为 `CheckpointWriteValidator`，让内存和 JDBC
+实现共享：
+
+- revision 顺序
+- 任务身份不变
+- 生命周期迁移
+- schemaVersion 不倒退
+- maxSteps 不变化
+- 已完成 Step 历史不能重写
+
+这样两种 Store 不会出现不同业务语义。
+
+#### 为什么 UPDATE 前仍然 SELECT
+
+SELECT 用于验证：
+
+- 当前任务身份
+- 状态迁移
+- Step 历史前缀
+- 当前实际 revision
+
+SELECT 与 UPDATE 之间仍可能发生并发，因此 UPDATE 必须继续带 revision 条件。前置 SELECT
+负责领域校验，条件 UPDATE 负责最终原子性。
+
+#### 数据库列与 JSON 交叉校验
+
+读取时验证：
+
+```text
+row.task_id        == snapshot.taskId
+row.revision       == snapshot.revision
+row.status         == snapshot.status
+row.schema_version == snapshot.schemaVersion
+row.created_at     == snapshot.createdAt
+row.updated_at     == snapshot.updatedAt
+```
+
+不一致通常表示手工修改、旧 Writer、迁移错误或数据损坏，不能当作普通 revision 冲突重试。
+
+#### 时间精度
+
+PostgreSQL `TIMESTAMP WITH TIME ZONE` 通常保存微秒精度，而 Java Instant 可能有纳秒精度。
+JDBC 索引列写入和对照时统一截断到微秒；完整精度仍保留在 Snapshot JSON 中。
+
+### 5. 测试与验收结果
+
+真实 H2 SQL 测试覆盖：
+
+- 执行 V1 建表脚本
+- INSERT revision 0
+- snapshot_json 实际存在
+- 读取并完整 decode
+- revision 条件更新
+- 重复创建冲突
+- 过期 revision 冲突
+- 两线程竞争只有一个成功
+- conversation 查询与排序
+- DELETE
+- 人工篡改 status 列后检测损坏
+- 纳秒 Instant 与数据库微秒精度兼容
+
+Spring 上下文测试还验证：
+
+- Hikari DataSource 启动
+- Flyway 发现 V1 migration
+- migration 成功应用
+- JDBC Store 和 Service Bean 成功创建
+
+全量结果：
+
+```text
+tests=90
+failures=0
+errors=0
+skipped=0
+```
+
+### 6. 成熟框架对照
+
+这种设计属于“索引字段 + JSON 状态”的混合持久化：
+
+- 高频查询和并发字段保持关系型列。
+- 工作流状态主体使用带 schemaVersion 的 JSON。
+- Runtime 依赖 Store 端口，不依赖数据库技术。
+
+第一版避免为动态 Agent Step 建立大量关联表，同时仍保留数据库级查询和并发能力。
+
+### 7. 面试问题与参考回答
+
+#### 问题一：为什么有 snapshot_json 还要保存 revision 列？
+
+参考回答：
+
+revision 需要出现在 UPDATE WHERE 条件和索引中。每次解析 JSON 再比较无法形成高效、清晰
+的数据库 CAS 操作。
+
+#### 问题二：SELECT 后为什么 UPDATE 还要检查 revision？
+
+参考回答：
+
+SELECT 和 UPDATE 之间存在并发窗口。SELECT 用于领域校验，最终 UPDATE 的 revision 条件
+才负责数据库原子性。
+
+#### 问题三：影响行数为 0 代表什么？
+
+参考回答：
+
+可能是任务不存在，也可能是 revision 已被其他写入推进。Store 再查询实际 revision，
+生成包含 expected/actual 的冲突异常。
+
+#### 问题四：为什么数据库列与 JSON 要重复保存？
+
+参考回答：
+
+列用于高效查询和并发，JSON 用于完整恢复。重复字段读取时必须交叉校验，避免两份数据
+静默分叉。
+
+#### 问题五：为什么使用 Flyway？
+
+参考回答：
+
+Checkpoint 结构属于持久化协议的一部分。Flyway 让建表和后续变更具有顺序、校验和部署
+记录，避免依赖应用启动时临时执行不可追踪的 DDL。
+
+#### 问题六：H2 测试通过是否等于 PostgreSQL 一定通过？
+
+参考回答：
+
+不等于。H2 用于快速验证 SQL 和 Store 语义，仍需要 PostgreSQL 集成或 Testcontainers
+测试覆盖驱动、时区、锁和方言差异。这是后续 CI 增强项。
+
+### 8. 对应提交
+
+```text
+Add JDBC checkpoint persistence
+```
+
+---
+
 ## 后续记录模板
 
 ### YYYY-MM-DD：切片名称

@@ -27,9 +27,20 @@ HTTP 请求
 
 ## 本地运行
 
-1. 设置环境变量 `SILICONFLOW_API_KEY`。
-2. 根据需要启动 MCP Server，并在 `agent.mcp.servers` 中配置地址。
-3. 执行 `mvn spring-boot:run`。
+1. 启动 PostgreSQL：`docker compose up -d postgres`。
+2. 设置环境变量 `SILICONFLOW_API_KEY`。
+3. 根据需要启动 MCP Server，并在 `agent.mcp.servers` 中配置地址。
+4. 执行 `mvn spring-boot:run`。
+
+默认数据库连接：
+
+```text
+url      = jdbc:postgresql://localhost:5432/koawa_agent
+username = koawa_agent
+password = koawa_agent
+```
+
+可使用 `DB_URL`、`DB_USERNAME` 和 `DB_PASSWORD` 覆盖。
 
 同步聊天接口：
 
@@ -56,10 +67,7 @@ POST /api/agent/v1/tasks/{taskId}/cancel
 ## Docker
 
 ```bash
-docker build -t koawa-agent:local .
-docker run --rm -p 9090:9090 \
-  -e SILICONFLOW_API_KEY=your-key \
-  koawa-agent:local
+SILICONFLOW_API_KEY=your-key docker compose up --build
 ```
 
 MCP Server 可独立部署，通过 `agent.mcp.servers` 配置连接；KoawaAgent 不携带 RAG 服务和向量数据库。

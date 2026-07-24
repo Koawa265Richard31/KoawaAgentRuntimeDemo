@@ -545,6 +545,7 @@ POST /api/agent/v1/tasks/{taskId}/approval
 
 - `JdbcAgentCheckpointStore`
 - Checkpoint 表结构和迁移脚本
+- PostgreSQL Docker Compose
 - Task 查询 API
 - Resume API
 

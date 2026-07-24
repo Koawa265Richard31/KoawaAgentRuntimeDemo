@@ -4,6 +4,12 @@ server:
 spring:
   application:
     name: koawa-agent
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/koawa_agent}
+    username: ${DB_USERNAME:koawa_agent}
+    password: ${DB_PASSWORD:koawa_agent}
+  flyway:
+    enabled: true
 
 agent:
   runtime:
