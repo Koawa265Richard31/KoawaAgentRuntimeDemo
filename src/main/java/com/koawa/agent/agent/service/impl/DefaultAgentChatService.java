@@ -20,6 +20,7 @@ package com.koawa.agent.agent.service.impl;
 import com.koawa.agent.agent.config.AgentRuntimeProperties;
 import com.koawa.agent.agent.domain.AgentRunResult;
 import com.koawa.agent.agent.domain.AgentState;
+import com.koawa.agent.agent.runner.AgentCheckpointLifecycle;
 import com.koawa.agent.agent.runner.AgentLoopRunner;
 import com.koawa.agent.agent.service.AgentChatService;
 import com.koawa.agent.agent.service.AgentConversationHistoryLoader;
@@ -37,6 +38,7 @@ public final class DefaultAgentChatService implements AgentChatService {
     private final AgentRuntimeProperties properties;
     private final AgentConversationHistoryLoader historyLoader;
     private final Clock clock;
+    private final AgentCheckpointLifecycle checkpointLifecycle;
 
     public DefaultAgentChatService(
             AgentLoopRunner runner,
@@ -47,7 +49,8 @@ public final class DefaultAgentChatService implements AgentChatService {
                 runner,
                 properties,
                 historyLoader,
-                Clock.systemUTC()
+                Clock.systemUTC(),
+                AgentCheckpointLifecycle.NOOP
         );
     }
 
@@ -56,6 +59,22 @@ public final class DefaultAgentChatService implements AgentChatService {
             AgentRuntimeProperties properties,
             AgentConversationHistoryLoader historyLoader,
             Clock clock
+    ) {
+        this(
+                runner,
+                properties,
+                historyLoader,
+                clock,
+                AgentCheckpointLifecycle.NOOP
+        );
+    }
+
+    public DefaultAgentChatService(
+            AgentLoopRunner runner,
+            AgentRuntimeProperties properties,
+            AgentConversationHistoryLoader historyLoader,
+            Clock clock,
+            AgentCheckpointLifecycle checkpointLifecycle
     ) {
         this.runner = Objects.requireNonNull(
                 runner,
@@ -72,6 +91,10 @@ public final class DefaultAgentChatService implements AgentChatService {
         this.clock = Objects.requireNonNull(
                 clock,
                 "clock cannot be null"
+        );
+        this.checkpointLifecycle = Objects.requireNonNull(
+                checkpointLifecycle,
+                "checkpointLifecycle cannot be null"
         );
     }
 
@@ -113,10 +136,14 @@ public final class DefaultAgentChatService implements AgentChatService {
                 .historySnapshot(historySnapshot)
                 .build();
 
+        checkpointLifecycle.initialize(initialState);
+
         AgentState completedState = Objects.requireNonNull(
                 runner.run(initialState),
                 "runner returned null state"
         );
+
+        checkpointLifecycle.completed(completedState);
 
         return AgentRunResult.from(completedState);
     }

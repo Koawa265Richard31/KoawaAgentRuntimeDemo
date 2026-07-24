@@ -4,6 +4,8 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.jdbc.core.JdbcTemplate;
 
+import java.time.Clock;
+
 @Configuration
 public class AgentCheckpointConfiguration {
 
@@ -28,8 +30,19 @@ public class AgentCheckpointConfiguration {
     @Bean
     public AgentCheckpointService agentCheckpointService(
             AgentCheckpointStore store,
-            AgentTaskSnapshotMapper mapper
+            AgentTaskSnapshotMapper mapper,
+            Clock clock
     ) {
-        return new AgentCheckpointService(store, mapper);
+        return new AgentCheckpointService(store, mapper, clock);
+    }
+
+    @Bean
+    public PersistentAgentCheckpointLifecycle agentCheckpointLifecycle(
+            AgentCheckpointService checkpointService,
+            Clock clock
+    ) {
+        return new PersistentAgentCheckpointLifecycle(
+                checkpointService,
+                clock);
     }
 }

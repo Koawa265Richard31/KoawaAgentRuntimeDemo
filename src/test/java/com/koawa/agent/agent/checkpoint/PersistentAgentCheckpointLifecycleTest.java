@@ -1,0 +1,165 @@
+package com.koawa.agent.agent.checkpoint;
+
+import com.koawa.agent.agent.domain.AgentAction;
+import com.koawa.agent.agent.domain.AgentActionType;
+import com.koawa.agent.agent.domain.AgentObservation;
+import com.koawa.agent.agent.domain.AgentState;
+import com.koawa.agent.agent.domain.AgentStep;
+import com.koawa.agent.agent.domain.AgentStopReason;
+import com.koawa.agent.agent.domain.AgentTaskSnapshot;
+import com.koawa.agent.agent.domain.AgentTaskStatus;
+import org.junit.jupiter.api.Test;
+
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+class PersistentAgentCheckpointLifecycleTest {
+
+    private static final Instant NOW =
+            Instant.parse("2026-07-24T06:00:00Z");
+
+    private final InMemoryAgentCheckpointStore store =
+            new InMemoryAgentCheckpointStore();
+    private final AgentCheckpointService service =
+            new AgentCheckpointService(
+                    store,
+                    new AgentTaskSnapshotMapper(),
+                    Clock.fixed(NOW, ZoneOffset.UTC));
+    private final PersistentAgentCheckpointLifecycle lifecycle =
+            new PersistentAgentCheckpointLifecycle(
+                    service,
+                    Clock.fixed(NOW, ZoneOffset.UTC),
+                    () -> "interrupt-1");
+
+    @Test
+    void shouldPersistInitialStepAndCompletedRevisions() {
+        AgentState state = state("task-1");
+
+        lifecycle.initialize(state);
+        assertCheckpoint(
+                "task-1",
+                0,
+                AgentTaskStatus.RUNNING,
+                0);
+
+        completeOneStep(state);
+        lifecycle.stepCommitted(state);
+        assertCheckpoint(
+                "task-1",
+                1,
+                AgentTaskStatus.RUNNING,
+                1);
+
+        state.setStopReason(AgentStopReason.FINAL_ANSWER);
+        state.setFinalAnswer("answer");
+        lifecycle.completed(state);
+        assertCheckpoint(
+                "task-1",
+                2,
+                AgentTaskStatus.COMPLETED,
+                1);
+    }
+
+    @Test
+    void shouldPersistClarificationAsWaitingInputWithInterrupt() {
+        AgentState state = state("task-2");
+        lifecycle.initialize(state);
+        state.setStopReason(AgentStopReason.ASK_CLARIFICATION);
+        state.setFinalAnswer("Which order?");
+
+        lifecycle.completed(state);
+
+        AgentTaskSnapshot snapshot =
+                store.load("task-2").orElseThrow();
+        assertEquals(1, snapshot.revision());
+        assertEquals(
+                AgentTaskStatus.WAITING_FOR_INPUT,
+                snapshot.status());
+        assertEquals(
+                "interrupt-1",
+                snapshot.pendingInterrupt().interruptId());
+        assertEquals(
+                "Which order?",
+                snapshot.pendingInterrupt().prompt());
+    }
+
+    @Test
+    void shouldMapEveryNonSuccessfulStopReasonToTaskStatus() {
+        Map<AgentStopReason, AgentTaskStatus> expectedStatuses = Map.of(
+                AgentStopReason.MAX_STEPS,
+                AgentTaskStatus.FAILED,
+                AgentStopReason.ERROR,
+                AgentTaskStatus.FAILED,
+                AgentStopReason.CANCELLED,
+                AgentTaskStatus.CANCELLED,
+                AgentStopReason.TIMEOUT,
+                AgentTaskStatus.TIMED_OUT);
+
+        int index = 0;
+        for (Map.Entry<AgentStopReason, AgentTaskStatus> entry
+                : expectedStatuses.entrySet()) {
+            String taskId = "terminal-task-" + index++;
+            AgentState state = state(taskId);
+            lifecycle.initialize(state);
+            state.setStopReason(entry.getKey());
+
+            lifecycle.completed(state);
+
+            assertEquals(
+                    entry.getValue(),
+                    store.load(taskId).orElseThrow().status());
+        }
+    }
+
+    private void assertCheckpoint(
+            String taskId,
+            long revision,
+            AgentTaskStatus status,
+            int nextStep
+    ) {
+        AgentTaskSnapshot snapshot = store.load(taskId).orElseThrow();
+        assertEquals(revision, snapshot.revision());
+        assertEquals(status, snapshot.status());
+        assertEquals(nextStep, snapshot.nextStep());
+    }
+
+    private AgentState state(String taskId) {
+        return AgentState.builder()
+                .conversationId("conversation-1")
+                .taskId(taskId)
+                .userId("user-1")
+                .originalQuestion("question")
+                .currentStep(0)
+                .maxSteps(4)
+                .deadlineAt(NOW.plusSeconds(300))
+                .steps(new ArrayList<>())
+                .historySnapshot(List.of())
+                .build();
+    }
+
+    private void completeOneStep(AgentState state) {
+        AgentAction action = AgentAction.builder()
+                .type(AgentActionType.CALL_MCP_TOOL)
+                .thought("call tool")
+                .arguments(Map.of())
+                .build();
+        AgentObservation observation = AgentObservation.builder()
+                .actionType(AgentActionType.CALL_MCP_TOOL)
+                .content("result")
+                .metadata(Map.of())
+                .success(true)
+                .build();
+        state.getSteps().add(AgentStep.builder()
+                .stepIndex(0)
+                .action(action)
+                .observation(observation)
+                .build());
+        state.setCurrentStep(1);
+    }
+}

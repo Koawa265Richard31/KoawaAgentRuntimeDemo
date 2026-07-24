@@ -1548,6 +1548,201 @@ Add JDBC checkpoint persistence
 
 ---
 
+## 2026-07-24：Checkpoint 接入 Agent Runtime
+
+### 1. 本次目标
+
+把已经实现的 Snapshot、Service 和 JDBC Store 接入真实执行链路，形成三个明确的持久化
+边界：
+
+- 新任务进入 AgentLoop 前创建 revision 0。
+- 每个完整 Step 提交后保存 RUNNING revision。
+- Runner 返回后保存终态或等待输入状态。
+
+本切片不实现 Resume。相同 taskId 再次调用当前的新任务入口会因初始 Checkpoint 已存在而
+冲突，这是刻意保留的保护；恢复必须走后续独立的 Resume 用例。
+
+### 2. 核心代码
+
+实现文件：
+
+- `agent/runner/AgentCheckpointLifecycle.java`
+- `agent/runner/AgentCheckpointLifecycleException.java`
+- `agent/checkpoint/PersistentAgentCheckpointLifecycle.java`
+- `agent/runner/AgentLoopRunner.java`
+- `agent/service/impl/DefaultAgentChatService.java`
+- `agent/config/AgentConfiguration.java`
+- `agent/checkpoint/AgentCheckpointConfiguration.java`
+
+Runtime 只依赖生命周期端口：
+
+```java
+public interface AgentCheckpointLifecycle {
+    void initialize(AgentState state);
+    void stepCommitted(AgentState state);
+    void completed(AgentState state);
+}
+```
+
+持久化实现再调用 `AgentCheckpointService`，因此 Runner 不知道 Snapshot、JSON、JDBC 或
+revision 如何实现。
+
+### 3. 执行流程
+
+一次正常执行的 revision 序列：
+
+```text
+DefaultAgentChatService
+  └─ initialize(initialState)
+       └─ revision 0 / RUNNING / nextStep 0
+
+AgentLoopRunner
+  └─ 执行 Action，得到 Observation
+  └─ steps.add(step)
+  └─ currentStep = stepIndex + 1
+  └─ stepCommitted(state)
+       └─ revision 1 / RUNNING / nextStep 1
+
+DefaultAgentChatService
+  └─ completed(completedState)
+       └─ revision 2 / COMPLETED / nextStep 1
+```
+
+这里 Step revision 和终态 revision 分开保存。前者表示“这一步已经完整提交”，后者表示
+“本轮运行已经结束”。即使最终 Action 本身产生答案，也不能在 Step 进入历史前先保存
+COMPLETED。
+
+停止原因映射：
+
+```text
+FINAL_ANSWER       → COMPLETED
+ASK_CLARIFICATION  → WAITING_FOR_INPUT + USER_INPUT interrupt
+CANCELLED          → CANCELLED
+TIMEOUT            → TIMED_OUT
+ERROR              → FAILED
+MAX_STEPS          → FAILED
+```
+
+### 4. 工程设计与取舍
+
+#### 为什么增加 Lifecycle 端口
+
+如果 Runner 直接调用 `AgentCheckpointService`，执行循环会依赖 Snapshot 映射和持久化
+用例。Lifecycle 端口只描述执行时机，让 Runtime 控制“何时保存”，让 Checkpoint 模块控制
+“保存什么、如何保存”。
+
+`NOOP` 实现保留了原有构造器和纯单元测试的兼容性；Spring 正式装配时注入
+`PersistentAgentCheckpointLifecycle`。
+
+#### 保存动作具体在哪里
+
+Step 保存位于：
+
+```java
+state.getSteps().add(step);
+state.setCurrentStep(stepIndex + 1);
+checkpointLifecycle.stepCommitted(state);
+```
+
+所以真正的提交点不是 `return`。`return` 只把内存状态交还调用方；Lifecycle 调用才会经
+Mapper、Codec 和 Store 把状态落库。
+
+初始与终态保存由 `DefaultAgentChatService` 包围 `runner.run(...)`，因为它负责一次完整
+Run 的应用层边界，而 Runner 只负责循环内的 Step 边界。
+
+#### 为什么保存失败不转换成 Agent ERROR
+
+规划或工具异常属于 Agent 执行结果，可以写成 `FAILED`。Checkpoint 保存异常代表系统
+无法确认刚刚的状态是否持久化。如果 Runner 把它吞掉并改成普通 ERROR：
+
+- 可能继续执行并重复产生外部副作用。
+- 可能再写一次终态，掩盖最初的 revision 冲突。
+- 调用方会误以为任务已可靠结束。
+
+因此持久化异常被包装为 `AgentCheckpointLifecycleException` 并直接向上传播，交给 API
+错误处理和监控；它不会被 AgentLoop 的通用异常分支改写。
+
+#### ASK_CLARIFICATION 为什么创建 interrupt
+
+`WAITING_FOR_INPUT` 仅表示生命周期状态，`PendingInterrupt` 才保存恢复所需的等待原因、
+提示语、类型和创建时间。后续 Resume API 会验证并消费这个 interrupt，而不是仅根据
+状态字符串猜测上下文。
+
+### 5. 测试与验收结果
+
+新增测试覆盖：
+
+- revision 依次为 0、1、2。
+- Step 回调发生在 Step 和 nextStep 都提交之后。
+- 终止原因到任务状态的完整映射。
+- ASK_CLARIFICATION 生成 USER_INPUT interrupt。
+- Checkpoint 异常向上传播，不被改写为 Agent ERROR。
+- Chat Service 严格按 initialize、run、completed 的顺序调用。
+
+全量结果：
+
+```text
+tests=96
+failures=0
+errors=0
+skipped=0
+```
+
+### 6. 成熟框架对照
+
+这与成熟图工作流框架在节点边界提交 Checkpoint 的思想一致：恢复依赖已提交边界，而不是
+恢复 Java 调用栈。KoawaAgent 当前以一个完整 `AgentStep` 作为最小提交单元，并用独立端口
+保持 Runtime 与具体 Checkpointer 解耦。
+
+当前仍缺少恢复侧闭环：加载 Snapshot、校验任务可恢复、重建 AgentState，并从 nextStep
+继续。这将是下一切片的核心。
+
+### 7. 面试问题与参考回答
+
+#### 问题一：为什么不在每次方法 return 时统一保存？
+
+参考回答：
+
+不同 return 只表示控制流结束，不等于状态已形成一致的持久化边界。Step 必须在 Action、
+Observation、steps 和 nextStep 全部更新后保存；整个 Run 的终态则由应用服务在 Runner
+返回后保存。
+
+#### 问题二：为什么最终一步会产生两个 revision？
+
+参考回答：
+
+第一个 revision 提交完整 Step，第二个 revision 提交任务生命周期终态。这让“已执行到
+哪里”和“为什么停止”分别具有明确边界，也为故障诊断和恢复提供更准确的信息。
+
+#### 问题三：Checkpoint 保存失败后为什么不继续运行？
+
+参考回答：
+
+系统已经无法证明当前 Step 是否持久化。继续执行可能导致恢复时重复调用外部工具，违反
+at-least-once 场景下的副作用安全，因此采用 fail-fast。
+
+#### 问题四：Lifecycle 接口是否过度设计？
+
+参考回答：
+
+它隔离的是变化轴：Runner 的循环算法与 JDBC、Codec、Snapshot 映射的变化原因不同。
+接口只有三个稳定边界，并提供 NOOP，不要求业务代码理解存储实现，因此成本较低。
+
+#### 问题五：有了自动保存，为什么还不能 Resume？
+
+参考回答：
+
+保存和恢复是两个不同用例。恢复还需要判断状态是否允许继续、重建 deadline、处理等待中断、
+保证只有一个执行者取得运行权，并从 nextStep 开始而不是重新创建 revision 0。
+
+### 8. 对应提交
+
+```text
+Integrate checkpoints with agent runtime
+```
+
+---
+
 ## 后续记录模板
 
 ### YYYY-MM-DD：切片名称

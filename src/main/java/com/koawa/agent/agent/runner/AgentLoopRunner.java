@@ -39,6 +39,7 @@ public class AgentLoopRunner {
     private final AgentCancellationChecker cancellationChecker;
     private final AgentRecoveryPolicy recoveryPolicy;
     private final Clock clock;
+    private final AgentCheckpointLifecycle checkpointLifecycle;
 
     private static final int MAX_PLANNING_RECOVERY_ATTEMPTS = 1;
 
@@ -55,7 +56,8 @@ public class AgentLoopRunner {
                 eventSink,
                 cancellationChecker,
                 recoveryPolicy,
-                Clock.systemUTC()
+                Clock.systemUTC(),
+                AgentCheckpointLifecycle.NOOP
         );
     }
 
@@ -66,6 +68,26 @@ public class AgentLoopRunner {
             AgentCancellationChecker cancellationChecker,
             AgentRecoveryPolicy recoveryPolicy,
             Clock clock
+    ) {
+        this(
+                planner,
+                executor,
+                eventSink,
+                cancellationChecker,
+                recoveryPolicy,
+                clock,
+                AgentCheckpointLifecycle.NOOP
+        );
+    }
+
+    public AgentLoopRunner(
+            AgentPlanner planner,
+            AgentActionExecutor executor,
+            AgentEventSink eventSink,
+            AgentCancellationChecker cancellationChecker,
+            AgentRecoveryPolicy recoveryPolicy,
+            Clock clock,
+            AgentCheckpointLifecycle checkpointLifecycle
     ) {
         this.planner = Objects.requireNonNull(
                 planner,
@@ -90,6 +112,10 @@ public class AgentLoopRunner {
         this.clock = Objects.requireNonNull(
                 clock,
                 "clock cannot be null"
+        );
+        this.checkpointLifecycle = Objects.requireNonNull(
+                checkpointLifecycle,
+                "checkpointLifecycle cannot be null"
         );
     }
 
@@ -202,6 +228,7 @@ public class AgentLoopRunner {
 
                 state.getSteps().add(step);
                 state.setCurrentStep(stepIndex + 1);
+                checkpointLifecycle.stepCommitted(state);
 
                 if (completeIfStopped(state)) {
                     return state;
@@ -236,6 +263,9 @@ public class AgentLoopRunner {
 
             return state;
         } catch (RuntimeException exception) {
+            if (exception instanceof AgentCheckpointLifecycleException) {
+                throw exception;
+            }
             if (completeIfStopped(state)) {
                 return state;
             }

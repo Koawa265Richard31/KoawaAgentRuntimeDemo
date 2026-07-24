@@ -524,6 +524,7 @@ POST /api/agent/v1/tasks/{taskId}/approval
 - Snapshot Mapper
 - Snapshot JSON Codec
 - `AgentCheckpointService`
+- `AgentCheckpointLifecycle`
 - revision 并发控制
 
 改造：

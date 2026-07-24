@@ -19,6 +19,7 @@ import com.koawa.agent.agent.prompt.PromptTemplateLoader;
 import com.koawa.agent.agent.recovery.AgentRecoveryPolicy;
 import com.koawa.agent.agent.recovery.DefaultAgentRecoveryPolicy;
 import com.koawa.agent.agent.runner.AgentCancellationChecker;
+import com.koawa.agent.agent.runner.AgentCheckpointLifecycle;
 import com.koawa.agent.agent.runner.AgentLoopRunner;
 import com.koawa.agent.agent.service.AgentChatService;
 import com.koawa.agent.agent.service.AgentConversationHistoryLoader;
@@ -116,7 +117,8 @@ public class AgentConfiguration {
             AgentEventSink eventSink,
             AgentCancellationChecker cancellationChecker,
             AgentRecoveryPolicy recoveryPolicy,
-            Clock clock
+            Clock clock,
+            AgentCheckpointLifecycle checkpointLifecycle
     ) {
         return new AgentLoopRunner(
                 planner,
@@ -124,7 +126,8 @@ public class AgentConfiguration {
                 eventSink,
                 cancellationChecker,
                 recoveryPolicy,
-                clock
+                clock,
+                checkpointLifecycle
         );
     }
 
@@ -133,13 +136,15 @@ public class AgentConfiguration {
             AgentLoopRunner runner,
             AgentRuntimeProperties properties,
             AgentConversationHistoryLoader historyLoader,
-            Clock clock
+            Clock clock,
+            AgentCheckpointLifecycle checkpointLifecycle
     ) {
         return new DefaultAgentChatService(
                 runner,
                 properties,
                 historyLoader,
-                clock
+                clock,
+                checkpointLifecycle
         );
     }
 }
