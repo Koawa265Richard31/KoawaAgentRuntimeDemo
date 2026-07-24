@@ -228,7 +228,6 @@ public enum AgentTaskStatus {
 - `revision`
 - `status`
 - `originalQuestion`
-- `currentStep`
 - `nextStep`
 - `maxSteps`
 - `deadlineAt`
@@ -240,6 +239,8 @@ public enum AgentTaskStatus {
 - `updatedAt`
 
 Snapshot 只保存可序列化数据，不能保存 Spring Bean、MCP Client、函数或线程对象。
+`nextStep` 是恢复后将要执行的步骤索引；已完成步骤数可以由 `steps.size()` 推导，
+不重复保存 `currentStep`，避免两个游标产生不一致。
 
 ### 6.3 Checkpoint Store
 
