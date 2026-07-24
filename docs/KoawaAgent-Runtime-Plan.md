@@ -522,6 +522,7 @@ POST /api/agent/v1/tasks/{taskId}/approval
 - `AgentCheckpointStore`
 - `InMemoryAgentCheckpointStore`
 - Snapshot Mapper
+- Snapshot JSON Codec
 - `AgentCheckpointService`
 - revision 并发控制
 

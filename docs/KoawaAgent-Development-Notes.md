@@ -1093,6 +1093,211 @@ Add checkpoint application service
 
 ---
 
+## 2026-07-24：Snapshot JSON 持久化协议
+
+### 1. 本次目标
+
+在真正连接数据库前，为 `AgentTaskSnapshot` 建立稳定、版本感知的 JSON 编解码边界。
+
+当前 Snapshot 仍然没有写入数据库；本切片解决 JDBC Store 保存 JSON 前的协议问题。
+
+### 2. 核心代码
+
+实现文件：
+
+- `agent/checkpoint/AgentTaskSnapshotJsonCodec.java`
+- `agent/checkpoint/AgentTaskSnapshotCodecException.java`
+- `agent/checkpoint/AgentTaskSnapshotJsonCodecTest.java`
+
+编码：
+
+```java
+String snapshotJson = codec.encode(snapshot);
+```
+
+解码：
+
+```java
+AgentTaskSnapshot snapshot = codec.decode(snapshotJson);
+```
+
+Codec 显式注册：
+
+```java
+new JavaTimeModule()
+```
+
+并关闭时间戳数组格式：
+
+```java
+SerializationFeature.WRITE_DATES_AS_TIMESTAMPS
+```
+
+因此 `Instant` 保存为可读且精度稳定的 ISO-8601 字符串。
+
+### 3. 执行流程
+
+未来 JDBC 写入：
+
+```text
+AgentTaskSnapshot
+       ↓ encode
+Snapshot JSON
+       ↓ INSERT / UPDATE
+checkpoint.snapshot_json
+```
+
+未来 JDBC 读取：
+
+```text
+checkpoint.snapshot_json
+       ↓ decode
+AgentTaskSnapshot
+       ↓ Snapshot Mapper
+AgentState
+```
+
+### 4. 工程设计与取舍
+
+#### revision 与 schemaVersion
+
+`revision` 表示同一个任务的状态版本：
+
+```text
+revision 0：任务创建
+revision 1：完成一个 Step
+revision 2：进入等待态
+```
+
+它用于乐观锁：
+
+```text
+UPDATE ... WHERE task_id = ? AND revision = expectedRevision
+```
+
+`schemaVersion` 表示 Snapshot JSON 的结构版本：
+
+```text
+schemaVersion 1：当前字段结构
+schemaVersion 2：未来的新字段或结构
+```
+
+区别：
+
+```text
+revision      每个任务独立递增，解决并发覆盖
+schemaVersion 全局数据协议版本，解决新旧代码兼容
+```
+
+#### 读写两端都检查版本
+
+编码未知版本可能把当前代码不理解的数据写入数据库；解码未知版本可能产生字段缺失或错误
+默认值。因此 Codec 在 encode 和 decode 两端都要求：
+
+```java
+snapshot.schemaVersion()
+        == AgentTaskSnapshot.CURRENT_SCHEMA_VERSION
+```
+
+未来支持 V2 时，应先增加显式 Migrator，而不是直接取消校验。
+
+#### Codec 与 Mapper 不合并
+
+```text
+Mapper：AgentState <-> AgentTaskSnapshot
+Codec：AgentTaskSnapshot <-> JSON
+Store：JSON <-> Database
+```
+
+分层后，可以独立测试运行态映射、JSON 协议和数据库并发，不需要通过一条超长链路定位
+错误。
+
+#### 专用 CodecException
+
+空 JSON、损坏 JSON、JSON null、字段构造失败和未知版本统一转化为
+`AgentTaskSnapshotCodecException`。上层可以把它识别为 Checkpoint 数据问题，而不是
+模型或工具执行失败。
+
+### 5. 测试与验收结果
+
+完整 Snapshot 往返覆盖：
+
+- 微秒级 `Instant`
+- StepSnapshot
+- Action arguments JSON
+- Observation metadata JSON
+- MessageSnapshot
+- recoveryContext
+- PendingInterrupt
+- revision 和 schemaVersion
+
+异常覆盖：
+
+- 损坏 JSON
+- 空字符串
+- JSON `null`
+- 编码未知 schemaVersion
+- 解码未知 schemaVersion
+
+全量结果：
+
+```text
+tests=86
+failures=0
+errors=0
+skipped=0
+```
+
+### 6. 成熟框架对照
+
+持久化系统通常不会直接依赖 Java 对象的默认序列化，而是建立带版本的数据协议。这样
+应用升级时可以识别旧 Snapshot，并通过迁移逻辑恢复，而不是依赖 Java 类结构碰巧兼容。
+
+### 7. 面试问题与参考回答
+
+#### 问题一：revision 是什么？
+
+参考回答：
+
+revision 是单个任务 Checkpoint 的单调递增版本号，用于乐观锁。更新时只有数据库当前
+revision 等于调用方读取到的 expectedRevision 才能成功。
+
+#### 问题二：revision 与 schemaVersion 有什么区别？
+
+参考回答：
+
+revision 解决同一个任务的并发更新，几乎每次保存都会变化；schemaVersion 解决 Snapshot
+JSON 格式兼容，只有数据协议变化时才变化。
+
+#### 问题三：为什么落库前要单独测试 JSON Codec？
+
+参考回答：
+
+数据库保存成功不代表数据能够恢复。Instant、record、嵌套枚举和不可变集合都可能在
+反序列化时失败，Codec 往返测试可以在接入数据库前隔离这些问题。
+
+#### 问题四：遇到未知 schemaVersion 为什么不忽略？
+
+参考回答：
+
+静默忽略可能把缺失字段当成默认值并继续执行工具，风险高于明确失败。应先识别版本，
+执行经过测试的数据迁移，再交给当前 Runtime。
+
+#### 问题五：为什么使用 ISO-8601 保存 Instant？
+
+参考回答：
+
+它带有明确 UTC 语义，可读性好，并能保留亚秒精度。相比时间戳数组或本地时间字符串，
+跨语言和跨时区恢复更稳定。
+
+### 8. 对应提交
+
+```text
+Add versioned checkpoint JSON codec
+```
+
+---
+
 ## 后续记录模板
 
 ### YYYY-MM-DD：切片名称
