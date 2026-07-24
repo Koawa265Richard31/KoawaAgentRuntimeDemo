@@ -887,6 +887,212 @@ Add agent task snapshot mapper
 
 ---
 
+## 2026-07-24：Checkpoint 用例编排服务
+
+### 1. 本次目标
+
+通过 `AgentCheckpointService` 把 Mapper 和 Store 组合成可直接调用的应用用例：
+
+- 创建任务的初始 Checkpoint。
+- 保存任务的下一 revision。
+- 加载 Snapshot 并重建新的 AgentState。
+
+本切片的 `load` 只读取数据，不自动恢复执行或改变任务状态。
+
+### 2. 核心代码
+
+实现文件：
+
+- `agent/checkpoint/AgentCheckpointService.java`
+- `agent/checkpoint/CheckpointNotFoundException.java`
+- `agent/checkpoint/AgentCheckpointServiceTest.java`
+
+创建：
+
+```java
+AgentTaskSnapshot initial = checkpointService.create(initialState);
+```
+
+更新：
+
+```java
+AgentTaskSnapshot next = checkpointService.save(
+        state,
+        AgentTaskStatus.WAITING_FOR_INPUT,
+        pendingInterrupt
+);
+```
+
+加载：
+
+```java
+Optional<LoadedAgentCheckpoint> loaded =
+        checkpointService.load(taskId);
+```
+
+### 3. 执行流程
+
+初始创建：
+
+```text
+initial AgentState
+  currentStep = 0
+  steps = []
+        ↓ Mapper
+RUNNING Snapshot revision 0
+        ↓ Store save(expectedRevision = -1)
+初始 Checkpoint
+```
+
+版本化保存：
+
+```text
+load current Snapshot revision N
+        ↓
+Mapper 创建 revision N + 1
+  createdAt 保持不变
+  updatedAt 使用当前时间
+        ↓
+Store save(expectedRevision = N)
+```
+
+加载：
+
+```text
+Store load
+    ↓
+Snapshot Mapper
+    ↓
+new AgentState
+```
+
+### 4. 工程设计与取舍
+
+#### Service、Mapper、Store 各自职责
+
+```text
+Service：编排用例和 revision 流程
+Mapper：运行时对象与持久化对象转换
+Store：原子保存和并发冲突检测
+```
+
+Service 不直接操作 Map，也不处理 JSON；Store 不负责构造 AgentState。
+
+#### 创建必须发生在 Step 0 之前
+
+初始 Checkpoint 强制：
+
+```text
+currentStep = 0
+steps = []
+```
+
+如果已经执行过步骤，应使用 `save`，不能伪装成新任务写 revision 0。
+
+#### createdAt 与 updatedAt 分离
+
+- `createdAt` 在任务所有 revision 中保持不变。
+- `updatedAt` 表示当前 revision 的保存时间。
+
+Service 在更新时从旧 Snapshot 继承 `createdAt`，并通过注入的 `Clock` 获取新
+`updatedAt`。
+
+#### load 不等于 resume
+
+`load` 可以读取 RUNNING、等待态或终态，用于审计和展示，但不会：
+
+- 把等待态改成 RUNNING。
+- 获取执行权。
+- 启动 AgentLoop。
+- 重新计算执行 deadline。
+
+真正的 resume/claim 需要输入校验、状态迁移和执行权控制，将在 HITL 阶段单独实现。
+
+#### 缺失与冲突使用不同异常
+
+```text
+CheckpointNotFoundException：任务不存在
+CheckpointConflictException：任务存在，但 revision 已变化
+```
+
+上层 API 可以分别映射为 404 和 409，而不是统一返回内部错误。
+
+### 5. 测试与验收结果
+
+覆盖内容：
+
+- 创建 revision 0 RUNNING Snapshot
+- 初始创建时间
+- 保存下一 revision
+- createdAt 保持、updatedAt 更新
+- PendingInterrupt 保存
+- 加载后重建独立 AgentState
+- 修改加载结果不污染 Store
+- 缺失任务
+- 重复创建
+- 拒绝用已执行状态创建初始 Checkpoint
+
+全量结果：
+
+```text
+tests=82
+failures=0
+errors=0
+skipped=0
+```
+
+### 6. 成熟框架对照
+
+Checkpoint Service 属于应用层用例，不是领域对象，也不是存储适配器。它让上层 Runtime
+只调用“创建、保存、加载”语义，而不用了解 revision 0、`NO_REVISION` 或时间继承等
+细节。
+
+### 7. 面试问题与参考回答
+
+#### 问题一：为什么不能让 AgentLoop 直接调用 Store？
+
+参考回答：
+
+Store 只提供持久化能力，不知道初始 revision、时间继承和 Mapper 转换。应用服务集中
+编排这些规则，避免 AgentLoop 同时承担执行、序列化和存储职责。
+
+#### 问题二：为什么注入 Clock？
+
+参考回答：
+
+直接调用 `Instant.now()` 会让时间相关测试不稳定。注入 Clock 后可以固定或推进时间，
+精确验证 createdAt 和 updatedAt。
+
+#### 问题三：为什么 load 不直接恢复执行？
+
+参考回答：
+
+读取数据和获取执行权是两个不同操作。直接执行会让查询接口意外推进任务，也无法处理
+等待输入、终态保护和并发 resume。load 保持无副作用，resume 由独立用例实现。
+
+#### 问题四：为什么区分 NotFound 和 Conflict？
+
+参考回答：
+
+NotFound 表示资源不存在，Conflict 表示调用方基于过期版本操作。两者的客户端处理方式
+不同：前者通常停止请求，后者可能重新加载最新状态后决定是否重试。
+
+#### 问题五：为什么 Service 仍然不能完全防止工具重复执行？
+
+参考回答：
+
+Checkpoint revision 能防止两个结果同时覆盖状态，但两个执行者可能在写 Checkpoint 前
+都已经调用工具。解决副作用重复需要执行租约和 `ToolExecutionStore` 幂等键，这是后续
+独立能力。
+
+### 8. 对应提交
+
+```text
+Add checkpoint application service
+```
+
+---
+
 ## 后续记录模板
 
 ### YYYY-MM-DD：切片名称
