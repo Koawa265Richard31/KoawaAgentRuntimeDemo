@@ -216,6 +216,49 @@ class AgentSnapshotRecoveryServiceTest {
     }
 
     @Test
+    void shouldRepairNewClarificationAfterEarlierInputWasConsumed() {
+        save(snapshot(
+                "later-clarification-task",
+                0,
+                AgentTaskStatus.RUNNING,
+                List.of(
+                        step(
+                                0,
+                                AgentActionType.CALL_MCP_TOOL,
+                                "first result"
+                        ),
+                        step(
+                                1,
+                                AgentActionType.ASK_CLARIFICATION,
+                                "Which branch?"
+                        )
+                ),
+                Map.of(
+                        AgentTaskSnapshotMapper.CONSUMED_USER_INPUT_STEP,
+                        "0"
+                ),
+                CREATED_AT
+        ));
+
+        AgentSnapshotRecoveryResult recovered =
+                service.restore("later-clarification-task", 0);
+
+        assertEquals(
+                AgentSnapshotRecoveryResult.Outcome
+                        .TERMINAL_STEP_REPAIRED,
+                recovered.outcome()
+        );
+        assertEquals(
+                AgentTaskStatus.WAITING_FOR_INPUT,
+                recovered.snapshot().status()
+        );
+        assertEquals(
+                "Which branch?",
+                recovered.snapshot().pendingInterrupt().prompt()
+        );
+    }
+
+    @Test
     void shouldRejectStaleRevisionAndMissingTask() {
         save(snapshot(
                 "revision-task",

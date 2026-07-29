@@ -63,4 +63,6 @@ public class AgentState {
 
     private int planningRecoveryAttempts;
 
+    private Integer consumedUserInputStep;
+
 }

@@ -35,6 +35,8 @@ public final class AgentTaskSnapshotMapper {
     static final String STOP_REASON = "stopReason";
     static final String FAILURE_TYPE = "failureType";
     static final String ERROR_MESSAGE = "errorMessage";
+    static final String CONSUMED_USER_INPUT_STEP =
+            "consumedUserInputStep";
 
     private static final TypeReference<Map<String, Object>> STRING_OBJECT_MAP =
             new TypeReference<>() {
@@ -98,6 +100,9 @@ public final class AgentTaskSnapshotMapper {
                 .planningRecoveryAttempts(readNonNegativeInt(
                         snapshot.recoveryContext(),
                         PLANNING_RECOVERY_ATTEMPTS))
+                .consumedUserInputStep(readOptionalNonNegativeInt(
+                        snapshot.recoveryContext(),
+                        CONSUMED_USER_INPUT_STEP))
                 .finalAnswer(snapshot.recoveryContext().get(FINAL_ANSWER))
                 .stopReason(readEnum(
                         snapshot.recoveryContext(),
@@ -184,6 +189,13 @@ public final class AgentTaskSnapshotMapper {
                 FAILURE_TYPE,
                 enumName(state.getFailureType()));
         putIfNotNull(context, ERROR_MESSAGE, state.getErrorMessage());
+        putIfNotNull(
+                context,
+                CONSUMED_USER_INPUT_STEP,
+                state.getConsumedUserInputStep() == null
+                        ? null
+                        : state.getConsumedUserInputStep().toString()
+        );
         return Map.copyOf(context);
     }
 
@@ -272,6 +284,16 @@ public final class AgentTaskSnapshotMapper {
                     "invalid recovery context value for " + key,
                     exception);
         }
+    }
+
+    private Integer readOptionalNonNegativeInt(
+            Map<String, String> context,
+            String key
+    ) {
+        if (!context.containsKey(key)) {
+            return null;
+        }
+        return readNonNegativeInt(context, key);
     }
 
     private <E extends Enum<E>> E readEnum(

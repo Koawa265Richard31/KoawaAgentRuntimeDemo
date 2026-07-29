@@ -3,14 +3,23 @@ package com.koawa.agent.agent.checkpoint;
 /**
  * Immutable request to assess whether a persisted task may be resumed.
  *
- * <p>M0-S1 only validates resume eligibility. User input is consumed in
- * M0-S3, and execution ownership is acquired in M0-S4.
+ * <p>M0-S1 defines resume eligibility, M0-S3 consumes {@code userInput},
+ * and M0-S4 will acquire execution ownership.
  */
 public record AgentResumeCommand(
         String taskId,
         long expectedRevision,
-        String interruptId
+        String interruptId,
+        String userInput
 ) {
+
+    public AgentResumeCommand(
+            String taskId,
+            long expectedRevision,
+            String interruptId
+    ) {
+        this(taskId, expectedRevision, interruptId, null);
+    }
 
     public AgentResumeCommand {
         if (taskId == null || taskId.isBlank()) {

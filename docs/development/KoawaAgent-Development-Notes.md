@@ -1323,3 +1323,244 @@ toolCallId、执行前后 Ledger、幂等或结果查询处理。
 ### 下一切片
 
 按执行计划停止在 M0-S2。下一步是 `M0-S3：实现澄清 Interrupt 消费`，本轮不继续实现。
+
+## 2026-07-29：M0-S3 澄清 Interrupt 一次性消费
+
+### 本切片目标
+
+本切片只闭合 `WAITING_FOR_INPUT → RUNNING` 的持久化边界，不取得执行权，也不直接运行
+Agent Loop：
+
+```text
+AgentResumeCommand
+  → 校验 taskId + expectedRevision + interruptId + userInput
+  → 加载 WAITING_FOR_INPUT Snapshot
+  → 恢复同一 AgentState
+  → 把用户回复追加到 historySnapshot
+  → 清除上一次 ASK_CLARIFICATION 的停止字段
+  → CAS 保存 RUNNING revision N + 1
+  → 清除 pendingInterrupt
+```
+
+M0-S4 才负责对这个 RUNNING 任务取得唯一执行权。
+
+### Command 新增 userInput
+
+`AgentResumeCommand` 新增可空字段：
+
+```java
+public record AgentResumeCommand(
+        String taskId,
+        long expectedRevision,
+        String interruptId,
+        String userInput
+) {
+}
+```
+
+保留三参数构造器，使 M0-S1 已有的普通 RUNNING Resume 调用不需要立刻改写。语义是：
+
+- RUNNING Resume 不使用 `userInput`。
+- `evaluate()` 保持 M0-S1 的职责，只读校验 status、revision 和 interruptId，不保存
+  Snapshot。
+- `consume()` 强制要求匹配的 interruptId 和非空 userInput，并执行一次性持久化。
+
+### 保存动作在哪里
+
+真正保存发生在 `AgentInterruptConsumptionService.consume()`：
+
+```java
+AgentTaskSnapshot saved = store.save(
+        next,
+        current.revision()
+);
+```
+
+这里的 `return` 仍然只负责返回保存结果：
+
+```java
+return new AgentInterruptConsumptionResult(
+        interrupt.interruptId(),
+        saved,
+        state
+);
+```
+
+因此顺序是“先 CAS 保存成功，再返回 Result”，不是“通过 return 自动落库”。
+
+### 为什么用户回复写入 historySnapshot
+
+用户回复是后续模型推理需要读取的对话事实，所以追加为标准 USER 消息：
+
+```java
+history.add(ChatMessage.user(userInput));
+state.setHistorySnapshot(history);
+```
+
+这样恢复后的 `AgentRequestAssembler` 可以按原有历史消息通道把回复交给模型。没有把回复塞进
+`Map<String, String> recoveryContext`，因为后者适合小型恢复控制数据，不适合承担完整对话
+存储。
+
+本切片仍沿用 M0 的 Snapshot v1。后续上下文体系成熟后，再把长期对话、RunItem 和
+Checkpoint 投影拆开；当前不跨切片重构存储模型。
+
+### CAS 如何实现一次性消费
+
+假设客户端读取到：
+
+```text
+taskId = task-1
+revision = 7
+status = WAITING_FOR_INPUT
+interruptId = interrupt-abc
+```
+
+第一次请求使用 `expectedRevision = 7`，保存：
+
+```text
+revision = 8
+status = RUNNING
+pendingInterrupt = null
+history += USER reply
+```
+
+第二次重复提交仍携带 `expectedRevision = 7`。Store 已经是 revision 8，因此抛出
+`CheckpointConflictException`，未来 REST 层映射为 HTTP 409。第二次请求不会再追加消息，
+也不会再推进 revision。
+
+错误 interruptId、缺少 userInput、任务不存在或状态不是 WAITING_FOR_INPUT，也都在保存前
+失败，原 Snapshot 保持不变。
+
+### 为什么还需要 consumedUserInputStep
+
+第一次定向测试暴露出一个重要的恢复歧义：
+
+```text
+最后一个 Step = ASK_CLARIFICATION
+status = RUNNING
+pendingInterrupt = null
+```
+
+这个形状可能表示两件完全不同的事：
+
+1. terminal Step 已保存，但 WAITING_FOR_INPUT 生命周期 revision 尚未保存，属于 M0-S2
+   应修复的崩溃窗口。
+2. WAITING_FOR_INPUT 已经存在，用户回复也已消费，任务正准备继续，不能再次退回等待态。
+
+两种情况都要求保留原 Steps，仅靠 `lastStep.isTerminal()` 无法区分。因此消费 revision 在
+`recoveryContext` 中写入一个轻量边界标记：
+
+```text
+consumedUserInputStep = 0
+```
+
+恢复服务只在“最后一步是 ASK_CLARIFICATION 且其 stepIndex 等于该标记”时返回
+`READY_TO_CONTINUE`。如果没有标记或 stepIndex 不匹配，仍按 M0-S2 规则修复为
+WAITING_FOR_INPUT。
+
+这个字段记录的是持久化边界，不是用户回复正文。使用 stepIndex 而不是单纯的 boolean，
+是为了避免后面出现第二个 ASK_CLARIFICATION 时误用旧标记；只有被消费的那个澄清 Step
+会匹配。
+
+### 为什么要清除停止字段
+
+等待态 Snapshot 中通常包含：
+
+```text
+stopReason = ASK_CLARIFICATION
+finalAnswer = 澄清问题文本
+```
+
+用户已经回答后，任务重新进入 RUNNING，这两个值如果继续保留，会让调用方误认为任务仍在
+停止。因此消费时清除：
+
+```java
+state.setStopReason(null);
+state.setFinalAnswer(null);
+state.setFailureType(null);
+state.setErrorMessage(null);
+```
+
+`originalQuestion`、taskId、conversationId、userId、已完成 Steps、nextStep、maxSteps、
+deadlineAt、createdAt 和 planningRecoveryAttempts 均保持。
+
+### 测试结果
+
+已执行确认：
+
+- 定向单元测试：`AgentInterruptConsumptionServiceTest`、
+  `AgentResumeServiceTest`、`AgentSnapshotRecoveryServiceTest` 全部通过。
+- checkpoint 包完整回归：通过。
+- 全量回归：128 tests，0 failures，0 errors，6 skipped。
+
+覆盖的关键行为：
+
+- 正确回复只消费一次，revision 增加 1，状态转为 RUNNING。
+- 同一 taskId、原 Steps 和 nextStep 保持。
+- 回复进入 historySnapshot，重启后仍能恢复并继续。
+- 后续新的 ASK_CLARIFICATION 不会被旧 stepIndex 标记误判为已消费。
+- 错误 interruptId 和缺失 userInput 不推进 Snapshot。
+- 重复提交返回 revision conflict，不重复追加回复。
+- 非 WAITING_FOR_INPUT 和不存在的任务被显式拒绝。
+
+PostgreSQL 验证：
+
+- 新增 `PostgresAgentInterruptConsumptionServiceTest`，覆盖 JDBC JSON 往返、revision CAS、
+  重启恢复和重复提交冲突。
+- 当前机器没有可用 Docker，该用例被 Testcontainers 跳过。
+- 因此本轮不能宣称 PostgreSQL 上的一次性消费已经实际验证；Docker/CI 可用后需要运行该
+  测试。
+
+尚未验证：
+
+- 两个执行者消费成功后谁取得唯一执行权。
+- Resume REST API 的 409 响应映射。
+- PostgreSQL 上两个并发 Resume 请求的实际竞争。
+- 用户回复后的完整模型调用 E2E。
+
+### 面试问题
+
+#### 问题一：为什么 interruptId 和 expectedRevision 两个都要校验？
+
+参考回答：
+
+`interruptId` 校验业务身份，防止用户回复投递给同一任务中的旧等待点；
+`expectedRevision` 校验并发版本，防止客户端基于旧 Snapshot 覆盖新状态。前者不能发现
+同一个 Interrupt 被并发消费，后者不能表达“回复的是哪个问题”，两者职责不同。
+
+#### 问题二：为什么重复提交选择 409，而不是静默返回成功？
+
+参考回答：
+
+当前 Result 没有请求幂等键，服务无法严格证明第二个请求与第一个请求内容完全相同。CAS
+冲突明确告诉客户端其前置状态已经过期，更安全。未来若引入稳定 resumeRequestId，可以
+保存并返回第一次结果，形成真正的幂等成功。
+
+#### 问题三：为什么用户回复放 historySnapshot，而不是 pendingInterrupt.context？
+
+参考回答：
+
+`pendingInterrupt` 表示尚未解决的等待条件，消费后必须清除；把回复留在其中会把“待处理”
+和“已发生的对话事实”混在一起。historySnapshot 是后续模型请求的既有输入通道，也能在
+重启后自然恢复。
+
+#### 问题四：为什么消费成功后不立刻调用 Agent Loop？
+
+参考回答：
+
+消费 Interrupt 与取得执行权是两个不同的并发边界。当前步骤只通过 CAS 把输入持久化并将
+状态变为 RUNNING；M0-S4 再通过 Claim/Lease 决定谁能执行。若在消费方法中直接运行，
+进程崩溃、并发 Resume 和超时处理会耦合在一个难以验证的事务中。
+
+#### 问题五：consumedUserInputStep 解决了什么歧义？
+
+参考回答：
+
+它区分了“ASK_CLARIFICATION Step 已保存但等待态未落库”和“等待态已经被用户回复消费”。
+两种 Snapshot 都可能表现为最后一步 terminal 且状态 RUNNING。没有显式边界标记，重启
+恢复会错误地再次生成 Interrupt，使任务重新等待。记录 stepIndex 还能防止后续新的澄清
+Step 被旧标记跳过。
+
+### 下一切片
+
+按执行计划停止在 M0-S3。下一步是 `M0-S4：执行权租约或 CAS Claim`，本轮不继续实现。

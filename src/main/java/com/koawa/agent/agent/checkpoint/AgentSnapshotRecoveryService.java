@@ -1,5 +1,6 @@
 package com.koawa.agent.agent.checkpoint;
 
+import com.koawa.agent.agent.domain.AgentActionType;
 import com.koawa.agent.agent.domain.AgentState;
 import com.koawa.agent.agent.domain.AgentStopReason;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot;
@@ -101,8 +102,25 @@ public final class AgentSnapshotRecoveryService {
                     AgentSnapshotRecoveryResult.Outcome.READY_TO_CONTINUE
             );
         }
+        if (isConsumedClarificationBoundary(state, lastStep)) {
+            return new AgentSnapshotRecoveryResult(
+                    snapshot,
+                    state,
+                    AgentSnapshotRecoveryResult.Outcome.READY_TO_CONTINUE
+            );
+        }
 
         return repairTerminalStep(snapshot, state, lastStep);
+    }
+
+    private boolean isConsumedClarificationBoundary(
+            AgentState state,
+            StepSnapshot lastStep
+    ) {
+        Integer consumedStep = state.getConsumedUserInputStep();
+        return lastStep.actionType() == AgentActionType.ASK_CLARIFICATION
+                && consumedStep != null
+                && consumedStep == lastStep.stepIndex();
     }
 
     private AgentSnapshotRecoveryResult repairTerminalStep(
