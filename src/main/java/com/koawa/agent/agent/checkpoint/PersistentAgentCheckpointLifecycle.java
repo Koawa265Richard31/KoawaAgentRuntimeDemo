@@ -6,7 +6,7 @@ import com.koawa.agent.agent.domain.AgentTaskSnapshot.InterruptType;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.PendingInterrupt;
 import com.koawa.agent.agent.domain.AgentTaskStatus;
 import com.koawa.agent.agent.runner.AgentCheckpointLifecycle;
-import com.koawa.agent.agent.runner.AgentCheckpointLifecycleException;
+import com.koawa.agent.agent.exception.AgentCheckpointLifecycleException;
 
 import java.time.Clock;
 import java.util.Map;

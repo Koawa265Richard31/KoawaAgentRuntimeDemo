@@ -1,6 +1,8 @@
 package com.koawa.agent.agent.checkpoint;
 
 import com.koawa.agent.agent.domain.AgentTaskSnapshot;
+import com.koawa.agent.agent.exception.CheckpointConflictException;
+import com.koawa.agent.agent.exception.CorruptedCheckpointException;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;

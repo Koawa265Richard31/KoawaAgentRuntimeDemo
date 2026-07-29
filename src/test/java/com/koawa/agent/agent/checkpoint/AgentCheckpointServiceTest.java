@@ -9,6 +9,8 @@ import com.koawa.agent.agent.domain.AgentTaskSnapshot;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.InterruptType;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.PendingInterrupt;
 import com.koawa.agent.agent.domain.AgentTaskStatus;
+import com.koawa.agent.agent.exception.CheckpointConflictException;
+import com.koawa.agent.agent.exception.CheckpointNotFoundException;
 import org.junit.jupiter.api.Test;
 
 import java.time.Clock;

@@ -1,4 +1,4 @@
-package com.koawa.agent.agent.checkpoint;
+package com.koawa.agent.agent.exception;
 
 /**
  * Raised when indexed checkpoint columns disagree with the Snapshot JSON.

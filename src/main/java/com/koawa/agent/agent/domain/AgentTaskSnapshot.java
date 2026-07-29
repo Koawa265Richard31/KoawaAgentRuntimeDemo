@@ -36,17 +36,26 @@ public record AgentTaskSnapshot(
 
     public AgentTaskSnapshot {
         if (schemaVersion <= 0) {
-            throw new IllegalArgumentException("schemaVersion must be positive");
+            throw new IllegalArgumentException(
+                    "schemaVersion must be positive"
+            );
         }
         requireText(taskId, "taskId");
         requireText(conversationId, "conversationId");
         if (revision < 0) {
-            throw new IllegalArgumentException("revision cannot be negative");
+            throw new IllegalArgumentException(
+                    "revision cannot be negative"
+            );
         }
-        Objects.requireNonNull(status, "status cannot be null");
+        Objects.requireNonNull(
+                status,
+                "status cannot be null"
+        );
         requireText(originalQuestion, "originalQuestion");
         if (nextStep < 0) {
-            throw new IllegalArgumentException("nextStep cannot be negative");
+            throw new IllegalArgumentException(
+                    "nextStep cannot be negative"
+            );
         }
         if (maxSteps <= 0) {
             throw new IllegalArgumentException("maxSteps must be positive");
@@ -111,7 +120,9 @@ public record AgentTaskSnapshot(
 
     private static void requireText(String value, String fieldName) {
         if (value == null || value.isBlank()) {
-            throw new IllegalArgumentException(fieldName + " cannot be blank");
+            throw new IllegalArgumentException(
+                    fieldName + " cannot be blank"
+            );
         }
     }
 

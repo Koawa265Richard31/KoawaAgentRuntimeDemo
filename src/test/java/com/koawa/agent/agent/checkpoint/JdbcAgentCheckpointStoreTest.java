@@ -4,6 +4,8 @@ import com.koawa.agent.agent.domain.AgentTaskSnapshot;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.InterruptType;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.PendingInterrupt;
 import com.koawa.agent.agent.domain.AgentTaskStatus;
+import com.koawa.agent.agent.exception.CheckpointConflictException;
+import com.koawa.agent.agent.exception.CorruptedCheckpointException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.jdbc.core.JdbcTemplate;

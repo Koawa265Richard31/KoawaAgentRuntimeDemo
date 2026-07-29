@@ -5,6 +5,7 @@ import com.koawa.agent.agent.domain.AgentActionType;
 import com.koawa.agent.agent.domain.AgentObservation;
 import com.koawa.agent.agent.domain.AgentState;
 import com.koawa.agent.agent.event.AgentEventSink;
+import com.koawa.agent.agent.exception.AgentCheckpointLifecycleException;
 import com.koawa.agent.agent.recovery.AgentRecoveryDecision;
 import org.junit.jupiter.api.Test;
 

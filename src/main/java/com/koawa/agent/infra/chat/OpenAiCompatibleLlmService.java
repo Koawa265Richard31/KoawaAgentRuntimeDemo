@@ -1,9 +1,10 @@
 package com.koawa.agent.infra.chat;
 
-import com.google.gson.Gson;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.koawa.agent.framework.convention.ChatMessage;
 import com.koawa.agent.framework.convention.ChatRequest;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -28,7 +29,7 @@ public final class OpenAiCompatibleLlmService implements LLMService {
 
     private final LlmProperties properties;
     private final HttpClient httpClient;
-    private final Gson gson = new Gson();
+    private final ObjectMapper objectMapper = new ObjectMapper();
 
     @Autowired
     public OpenAiCompatibleLlmService(LlmProperties properties) {
@@ -115,56 +116,68 @@ public final class OpenAiCompatibleLlmService implements LLMService {
     }
 
     private String buildBody(ChatRequest request) {
-        JsonObject body = new JsonObject();
-        body.addProperty("model", properties.getModel());
-        body.add("messages", toMessages(request.getMessages()));
+        ObjectNode body = objectMapper.createObjectNode();
+        body.put("model", properties.getModel());
+        body.set("messages", toMessages(request.getMessages()));
         addIfPresent(body, "temperature", request.getTemperature());
         addIfPresent(body, "top_p", request.getTopP());
         addIfPresent(body, "top_k", request.getTopK());
         addIfPresent(body, "max_tokens", request.getMaxTokens());
         if (Boolean.TRUE.equals(request.getThinking())) {
-            body.addProperty("enable_thinking", true);
+            body.put("enable_thinking", true);
         }
-        return gson.toJson(body);
+        try {
+            return objectMapper.writeValueAsString(body);
+        } catch (JsonProcessingException exception) {
+            throw new IllegalStateException(
+                    "failed to serialize LLM request body",
+                    exception
+            );
+        }
     }
 
-    private JsonArray toMessages(List<ChatMessage> messages) {
-        JsonArray result = new JsonArray();
+    private ArrayNode toMessages(List<ChatMessage> messages) {
+        ArrayNode result = objectMapper.createArrayNode();
         if (messages == null) {
             return result;
         }
         for (ChatMessage message : messages) {
-            JsonObject json = new JsonObject();
-            json.addProperty(
+            ObjectNode json = result.addObject();
+            json.put(
                     "role",
                     message.getRole().name().toLowerCase()
             );
-            json.addProperty("content", message.getContent());
-            result.add(json);
+            json.put("content", message.getContent());
         }
         return result;
     }
 
-    private void addIfPresent(JsonObject body, String name, Number value) {
+    private void addIfPresent(ObjectNode body, String name, Number value) {
         if (value != null) {
-            body.addProperty(name, value);
+            body.set(name, objectMapper.valueToTree(value));
         }
     }
 
     private String extractContent(String responseBody) {
-        JsonObject root = JsonParser.parseString(responseBody).getAsJsonObject();
-        JsonArray choices = root.getAsJsonArray("choices");
-        if (choices == null || choices.isEmpty()) {
+        JsonNode root;
+        try {
+            root = objectMapper.readTree(responseBody);
+        } catch (JsonProcessingException exception) {
+            throw new IllegalStateException(
+                    "LLM response is not valid JSON",
+                    exception
+            );
+        }
+        JsonNode choices = root.get("choices");
+        if (choices == null || !choices.isArray() || choices.isEmpty()) {
             throw new IllegalStateException("LLM response contains no choices");
         }
-        JsonObject message = choices.get(0)
-                .getAsJsonObject()
-                .getAsJsonObject("message");
+        JsonNode message = choices.get(0).get("message");
         if (message == null
-                || !message.has("content")
-                || message.get("content").isJsonNull()) {
+                || message.get("content") == null
+                || message.get("content").isNull()) {
             throw new IllegalStateException("LLM response contains no content");
         }
-        return message.get("content").getAsString();
+        return message.get("content").asText();
     }
 }

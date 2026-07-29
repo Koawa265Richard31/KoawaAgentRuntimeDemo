@@ -1,23 +1,8 @@
-/*
- * Licensed to the Apache Software Foundation (ASF) under one or more
- * contributor license agreements.  See the NOTICE file distributed with
- * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0
- * (the "License"); you may not use this file except in compliance with
- * the License.  You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
-
 package com.koawa.agent.agent.planner;
 
-import com.google.gson.Gson;
+import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.koawa.agent.agent.domain.AgentAction;
 import com.koawa.agent.agent.domain.AgentObservation;
 import com.koawa.agent.agent.domain.AgentState;
@@ -37,7 +22,8 @@ import java.util.Objects;
 public class AgentRequestAssembler {
 
     private final PromptTemplateLoader promptTemplateLoader;
-    private final Gson gson = new Gson();
+    private final ObjectMapper objectMapper = new ObjectMapper()
+            .setSerializationInclusion(JsonInclude.Include.NON_NULL);
 
     public AgentRequestAssembler(
             PromptTemplateLoader promptTemplateLoader
@@ -142,7 +128,7 @@ public class AgentRequestAssembler {
                     .append('\n');
 
             builder.append("arguments: ")
-                    .append(gson.toJson(
+                    .append(toJson(
                             action.getArguments() == null
                                     ? Map.of()
                                     : action.getArguments()
@@ -196,12 +182,23 @@ public class AgentRequestAssembler {
                     .append(
                             tool.inputSchema() == null
                                     ? "{}"
-                                    : gson.toJson(tool.inputSchema())
+                                    : toJson(tool.inputSchema())
                     )
                     .append("\n\n");
         }
 
         return builder.toString().trim();
+    }
+
+    private String toJson(Object value) {
+        try {
+            return objectMapper.writeValueAsString(value);
+        } catch (JsonProcessingException exception) {
+            throw new IllegalStateException(
+                    "failed to render prompt JSON",
+                    exception
+            );
+        }
     }
 
     private String formatNullable(String value) {

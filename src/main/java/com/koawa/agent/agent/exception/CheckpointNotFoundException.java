@@ -1,4 +1,4 @@
-package com.koawa.agent.agent.checkpoint;
+package com.koawa.agent.agent.exception;
 
 /**
  * Raised when an operation requires a checkpoint that does not exist.

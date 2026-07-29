@@ -23,7 +23,9 @@ HTTP 请求
 以下能力明确不放入本仓库：内置 RAG、知识库业务、多 Agent、图工作流、Skills/A2A、可视化编排和通用沙箱平台。测试使用的固定脚本 Planner 也只存在于测试源集中。
 
 完整的架构取舍、目标模型、阶段路线和验收标准见：
-[KoawaAgent Runtime 设计与实施规划](docs/KoawaAgent-Runtime-Plan.md)。
+[KoawaAgent Coding Harness 执行规划](.agents/KoawaAgent-Coding-Harness-Codex-Execution-Plan.md)。
+
+编码代理（Codex、Claude Code 等）开始工作前必须先阅读 [AGENTS.md](AGENTS.md)。
 
 ## 本地运行
 

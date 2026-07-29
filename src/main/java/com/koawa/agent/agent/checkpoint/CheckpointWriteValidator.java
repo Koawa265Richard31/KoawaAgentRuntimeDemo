@@ -1,6 +1,7 @@
 package com.koawa.agent.agent.checkpoint;
 
 import com.koawa.agent.agent.domain.AgentTaskSnapshot;
+import com.koawa.agent.agent.exception.CheckpointConflictException;
 
 import java.util.Objects;
 

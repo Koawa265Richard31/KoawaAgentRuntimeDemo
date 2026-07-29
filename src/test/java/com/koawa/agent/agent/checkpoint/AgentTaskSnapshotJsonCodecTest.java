@@ -7,6 +7,7 @@ import com.koawa.agent.agent.domain.AgentTaskSnapshot.MessageSnapshot;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.PendingInterrupt;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.StepSnapshot;
 import com.koawa.agent.agent.domain.AgentTaskStatus;
+import com.koawa.agent.agent.exception.AgentTaskSnapshotCodecException;
 import com.koawa.agent.framework.convention.ChatMessage;
 import org.junit.jupiter.api.Test;
 

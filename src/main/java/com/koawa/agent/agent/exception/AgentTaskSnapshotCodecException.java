@@ -1,4 +1,4 @@
-package com.koawa.agent.agent.checkpoint;
+package com.koawa.agent.agent.exception;
 
 /**
  * Raised when checkpoint JSON cannot be encoded, decoded, or migrated.

@@ -4,6 +4,7 @@ import com.koawa.agent.agent.domain.AgentState;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.PendingInterrupt;
 import com.koawa.agent.agent.domain.AgentTaskStatus;
+import com.koawa.agent.agent.exception.CheckpointNotFoundException;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -45,7 +46,8 @@ public final class AgentCheckpointService {
                 || initialState.getSteps() != null
                 && !initialState.getSteps().isEmpty()) {
             throw new IllegalArgumentException(
-                    "an initial checkpoint must start before step zero");
+                    "an initial checkpoint must start before step zero"
+            );
         }
 
         Instant now = clock.instant();
@@ -55,7 +57,8 @@ public final class AgentCheckpointService {
                 0,
                 null,
                 now,
-                now);
+                now
+        );
         return store.save(snapshot, AgentCheckpointStore.NO_REVISION);
     }
 

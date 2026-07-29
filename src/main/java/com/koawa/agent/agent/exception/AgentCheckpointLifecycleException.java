@@ -1,4 +1,4 @@
-package com.koawa.agent.agent.runner;
+package com.koawa.agent.agent.exception;
 
 /**
  * Raised when a runtime checkpoint boundary cannot be persisted safely.

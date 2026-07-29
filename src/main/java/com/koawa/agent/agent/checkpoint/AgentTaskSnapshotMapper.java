@@ -1,8 +1,8 @@
 package com.koawa.agent.agent.checkpoint;
 
-import com.google.gson.Gson;
-import com.google.gson.JsonParseException;
-import com.google.gson.reflect.TypeToken;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.koawa.agent.agent.domain.AgentAction;
 import com.koawa.agent.agent.domain.AgentFailureType;
 import com.koawa.agent.agent.domain.AgentObservation;
@@ -14,9 +14,9 @@ import com.koawa.agent.agent.domain.AgentTaskSnapshot.MessageSnapshot;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.PendingInterrupt;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.StepSnapshot;
 import com.koawa.agent.agent.domain.AgentTaskStatus;
+import com.koawa.agent.agent.exception.AgentTaskSnapshotMappingException;
 import com.koawa.agent.framework.convention.ChatMessage;
 
-import java.lang.reflect.Type;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -36,18 +36,20 @@ public final class AgentTaskSnapshotMapper {
     static final String FAILURE_TYPE = "failureType";
     static final String ERROR_MESSAGE = "errorMessage";
 
-    private static final Type STRING_OBJECT_MAP =
-            new TypeToken<Map<String, Object>>() {
-            }.getType();
+    private static final TypeReference<Map<String, Object>> STRING_OBJECT_MAP =
+            new TypeReference<>() {
+            };
 
-    private final Gson gson;
+    private final ObjectMapper objectMapper;
 
     public AgentTaskSnapshotMapper() {
-        this(new Gson());
+        this(new ObjectMapper());
     }
 
-    public AgentTaskSnapshotMapper(Gson gson) {
-        this.gson = Objects.requireNonNull(gson, "gson cannot be null");
+    public AgentTaskSnapshotMapper(ObjectMapper objectMapper) {
+        this.objectMapper = Objects.requireNonNull(
+                objectMapper,
+                "objectMapper cannot be null");
     }
 
     public AgentTaskSnapshot toSnapshot(
@@ -224,7 +226,14 @@ public final class AgentTaskSnapshotMapper {
     }
 
     private String toJsonObject(Map<String, Object> value) {
-        return gson.toJson(value == null ? Map.of() : value);
+        try {
+            return objectMapper.writeValueAsString(
+                    value == null ? Map.of() : value);
+        } catch (JsonProcessingException exception) {
+            throw new AgentTaskSnapshotMappingException(
+                    "step data cannot be serialized to JSON",
+                    exception);
+        }
     }
 
     private Map<String, Object> fromJsonObject(
@@ -232,7 +241,7 @@ public final class AgentTaskSnapshotMapper {
             String fieldName
     ) {
         try {
-            Map<String, Object> value = gson.fromJson(
+            Map<String, Object> value = objectMapper.readValue(
                     json,
                     STRING_OBJECT_MAP);
             if (value == null) {
@@ -240,7 +249,7 @@ public final class AgentTaskSnapshotMapper {
                         fieldName + " must contain a JSON object");
             }
             return new LinkedHashMap<>(value);
-        } catch (JsonParseException | IllegalStateException exception) {
+        } catch (JsonProcessingException exception) {
             throw new AgentTaskSnapshotMappingException(
                     fieldName + " must contain a valid JSON object",
                     exception);

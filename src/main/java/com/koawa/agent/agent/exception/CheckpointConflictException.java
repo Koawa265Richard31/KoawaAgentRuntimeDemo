@@ -1,4 +1,4 @@
-package com.koawa.agent.agent.checkpoint;
+package com.koawa.agent.agent.exception;
 
 /**
  * Raised when a checkpoint compare-and-set write observes a different revision.
