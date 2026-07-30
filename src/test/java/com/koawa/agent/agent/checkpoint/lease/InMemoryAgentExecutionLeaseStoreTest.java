@@ -1,5 +1,7 @@
-package com.koawa.agent.agent.checkpoint;
+package com.koawa.agent.agent.checkpoint.lease;
 
+import com.koawa.agent.agent.checkpoint.AgentCheckpointStore;
+import com.koawa.agent.agent.checkpoint.InMemoryAgentCheckpointStore;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot;
 import com.koawa.agent.agent.domain.AgentTaskStatus;
 import com.koawa.agent.agent.exception.AgentExecutionConflictException;

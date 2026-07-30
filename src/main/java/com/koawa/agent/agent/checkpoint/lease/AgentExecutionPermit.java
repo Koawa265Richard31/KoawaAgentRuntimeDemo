@@ -1,4 +1,4 @@
-package com.koawa.agent.agent.checkpoint;
+package com.koawa.agent.agent.checkpoint.lease;
 
 import java.time.Instant;
 import java.util.Objects;

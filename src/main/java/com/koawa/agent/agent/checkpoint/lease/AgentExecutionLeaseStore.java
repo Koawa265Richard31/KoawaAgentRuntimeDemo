@@ -1,4 +1,4 @@
-package com.koawa.agent.agent.checkpoint;
+package com.koawa.agent.agent.checkpoint.lease;
 
 import com.koawa.agent.agent.exception.AgentExecutionConflictException;
 import com.koawa.agent.agent.exception.AgentExecutionLeaseLostException;

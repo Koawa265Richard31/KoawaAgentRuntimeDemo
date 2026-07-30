@@ -1775,3 +1775,60 @@ Shell、Git 或 MCP 操作。外部副作用仍需要稳定 toolCallId、幂等�
 
 下一步是 `M0-S4c`：增加 Flyway V2 和 JDBC Lease Store，把 Acquire/Renew/Release 与
 Checkpoint revision 条件落实到 PostgreSQL。M0-S4b 到此停止，不提前接 Agent Loop。
+
+## 2026-07-30：M0-S4b-r Lease 子包整理
+
+### 本切片目标
+
+随着 Lease 协议加入，原 `agent.checkpoint` 根包同时承载 Snapshot、Resume、Interrupt 和
+执行权协调，职责开始混杂。本切片只进行包结构移动：
+
+```text
+agent.checkpoint.lease
+├── AgentExecutionPermit
+├── AgentExecutionLeaseStore
+└── InMemoryAgentExecutionLeaseStore
+```
+
+测试同步移动到：
+
+```text
+src/test/.../agent/checkpoint/lease
+```
+
+异常仍保留在统一的 `agent.exception` 包；Snapshot、Resume 和 Interrupt 本轮不移动，避免
+把纯整理扩大成跨模块重构。所有 Lease 业务逻辑保持不变。
+
+### 为什么按职责边界分包
+
+这三个概念虽然都与恢复有关，但回答的问题不同：
+
+```text
+Snapshot  保存“执行到哪里”
+Resume    决定“如何恢复”
+Lease     决定“谁有权继续执行”
+```
+
+Lease 后续还会增加 JDBC Store、心跳和 Fenced Write。提前建立 `checkpoint.lease` 边界，
+可以避免这些协调类继续堆入 Checkpoint 根包，也让依赖方向更清楚。
+
+### 测试结果
+
+- Lease 定向测试：6 tests，0 failures，0 errors，0 skipped。
+- 全量回归：133 tests，0 failures，0 errors，6 skipped。
+- `git diff --check`：通过。
+
+### 面试问题
+
+#### 为什么不是简单地按 model、service、impl 分包？
+
+参考回答：
+
+`model/service/impl` 只描述技术形态，容易把不同业务边界的类重新混在一起。按 Snapshot、
+Resume、Lease 分包能够直接表达不同的一致性职责，使 JDBC Lease Store 不会依赖 Resume
+用例，也避免 Lease 心跳污染 Snapshot revision。
+
+### 下一切片
+
+下一步仍是 `M0-S4c`：在 `checkpoint.lease` 中增加 JDBC Lease Store，并通过 Flyway V2
+增加独立 Lease 表。
