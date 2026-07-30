@@ -1,4 +1,4 @@
-package com.koawa.agent.agent.checkpoint;
+package com.koawa.agent.agent.checkpoint.snapshot;
 
 import com.koawa.agent.agent.domain.AgentTaskSnapshot;
 import com.koawa.agent.agent.exception.CheckpointConflictException;

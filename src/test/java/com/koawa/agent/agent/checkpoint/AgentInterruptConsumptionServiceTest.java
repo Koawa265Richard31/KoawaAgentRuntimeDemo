@@ -1,5 +1,9 @@
 package com.koawa.agent.agent.checkpoint;
 
+import com.koawa.agent.agent.checkpoint.resume.*;
+import com.koawa.agent.agent.checkpoint.snapshot.AgentCheckpointStore;
+import com.koawa.agent.agent.checkpoint.snapshot.AgentTaskSnapshotMapper;
+import com.koawa.agent.agent.checkpoint.snapshot.InMemoryAgentCheckpointStore;
 import com.koawa.agent.agent.domain.AgentActionType;
 import com.koawa.agent.agent.domain.AgentStopReason;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot;
@@ -76,14 +80,13 @@ class AgentInterruptConsumptionServiceTest {
                 consumed.snapshot().historySnapshot()
         );
         assertFalse(consumed.snapshot().recoveryContext()
-                .containsKey(AgentTaskSnapshotMapper.STOP_REASON));
+                .containsKey("stopReason"));
         assertFalse(consumed.snapshot().recoveryContext()
-                .containsKey(AgentTaskSnapshotMapper.FINAL_ANSWER));
+                .containsKey("finalAnswer"));
         assertEquals(
                 "0",
                 consumed.snapshot().recoveryContext().get(
-                        AgentTaskSnapshotMapper
-                                .CONSUMED_USER_INPUT_STEP
+                        "consumedUserInputStep"
                 )
         );
         assertEquals(0, consumed.state().getConsumedUserInputStep());
@@ -235,12 +238,11 @@ class AgentInterruptConsumptionServiceTest {
                         "earlier context"
                 )),
                 Map.of(
-                        AgentTaskSnapshotMapper
-                                .PLANNING_RECOVERY_ATTEMPTS,
+                        "planningRecoveryAttempts",
                         "0",
-                        AgentTaskSnapshotMapper.STOP_REASON,
+                        "stopReason",
                         AgentStopReason.ASK_CLARIFICATION.name(),
-                        AgentTaskSnapshotMapper.FINAL_ANSWER,
+                        "finalAnswer",
                         "Which repository?"
                 ),
                 new PendingInterrupt(

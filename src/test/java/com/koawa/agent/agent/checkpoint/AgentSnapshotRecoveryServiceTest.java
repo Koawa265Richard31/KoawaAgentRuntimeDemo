@@ -1,5 +1,10 @@
 package com.koawa.agent.agent.checkpoint;
 
+import com.koawa.agent.agent.checkpoint.resume.AgentSnapshotRecoveryResult;
+import com.koawa.agent.agent.checkpoint.resume.AgentSnapshotRecoveryService;
+import com.koawa.agent.agent.checkpoint.snapshot.AgentCheckpointStore;
+import com.koawa.agent.agent.checkpoint.snapshot.AgentTaskSnapshotMapper;
+import com.koawa.agent.agent.checkpoint.snapshot.InMemoryAgentCheckpointStore;
 import com.koawa.agent.agent.domain.AgentAction;
 import com.koawa.agent.agent.domain.AgentActionType;
 import com.koawa.agent.agent.domain.AgentObservation;
@@ -234,7 +239,7 @@ class AgentSnapshotRecoveryServiceTest {
                         )
                 ),
                 Map.of(
-                        AgentTaskSnapshotMapper.CONSUMED_USER_INPUT_STEP,
+                        "consumedUserInputStep",
                         "0"
                 ),
                 CREATED_AT

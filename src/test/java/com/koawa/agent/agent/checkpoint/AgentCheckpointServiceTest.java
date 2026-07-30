@@ -1,5 +1,8 @@
 package com.koawa.agent.agent.checkpoint;
 
+import com.koawa.agent.agent.checkpoint.snapshot.AgentCheckpointService;
+import com.koawa.agent.agent.checkpoint.snapshot.AgentTaskSnapshotMapper;
+import com.koawa.agent.agent.checkpoint.snapshot.InMemoryAgentCheckpointStore;
 import com.koawa.agent.agent.domain.AgentAction;
 import com.koawa.agent.agent.domain.AgentActionType;
 import com.koawa.agent.agent.domain.AgentObservation;

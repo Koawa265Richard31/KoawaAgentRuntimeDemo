@@ -1,4 +1,4 @@
-package com.koawa.agent.agent.checkpoint;
+package com.koawa.agent.agent.checkpoint.snapshot;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;

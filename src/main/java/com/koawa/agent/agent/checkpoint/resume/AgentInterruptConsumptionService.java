@@ -1,5 +1,7 @@
-package com.koawa.agent.agent.checkpoint;
+package com.koawa.agent.agent.checkpoint.resume;
 
+import com.koawa.agent.agent.checkpoint.snapshot.AgentCheckpointStore;
+import com.koawa.agent.agent.checkpoint.snapshot.AgentTaskSnapshotMapper;
 import com.koawa.agent.agent.domain.AgentState;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.PendingInterrupt;

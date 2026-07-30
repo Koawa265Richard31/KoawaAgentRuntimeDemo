@@ -1,7 +1,12 @@
 package com.koawa.agent.agent.checkpoint;
 
-import com.koawa.agent.agent.checkpoint.AgentResumeResult.NextAction;
-import com.koawa.agent.agent.checkpoint.AgentResumeResult.RejectionReason;
+import com.koawa.agent.agent.checkpoint.resume.AgentResumeCommand;
+import com.koawa.agent.agent.checkpoint.resume.AgentResumeResult;
+import com.koawa.agent.agent.checkpoint.resume.AgentResumeResult.NextAction;
+import com.koawa.agent.agent.checkpoint.resume.AgentResumeResult.RejectionReason;
+import com.koawa.agent.agent.checkpoint.resume.AgentResumeService;
+import com.koawa.agent.agent.checkpoint.snapshot.AgentCheckpointStore;
+import com.koawa.agent.agent.checkpoint.snapshot.InMemoryAgentCheckpointStore;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.InterruptType;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.PendingInterrupt;

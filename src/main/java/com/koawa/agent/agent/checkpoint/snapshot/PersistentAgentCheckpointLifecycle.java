@@ -1,4 +1,4 @@
-package com.koawa.agent.agent.checkpoint;
+package com.koawa.agent.agent.checkpoint.snapshot;
 
 import com.koawa.agent.agent.domain.AgentState;
 import com.koawa.agent.agent.domain.AgentStopReason;

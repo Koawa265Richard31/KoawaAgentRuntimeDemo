@@ -1,5 +1,11 @@
 package com.koawa.agent.agent.checkpoint;
 
+import com.koawa.agent.agent.checkpoint.resume.AgentSnapshotRecoveryResult;
+import com.koawa.agent.agent.checkpoint.resume.AgentSnapshotRecoveryService;
+import com.koawa.agent.agent.checkpoint.snapshot.AgentCheckpointStore;
+import com.koawa.agent.agent.checkpoint.snapshot.AgentTaskSnapshotJsonCodec;
+import com.koawa.agent.agent.checkpoint.snapshot.AgentTaskSnapshotMapper;
+import com.koawa.agent.agent.checkpoint.snapshot.JdbcAgentCheckpointStore;
 import com.koawa.agent.agent.domain.AgentActionType;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.StepSnapshot;

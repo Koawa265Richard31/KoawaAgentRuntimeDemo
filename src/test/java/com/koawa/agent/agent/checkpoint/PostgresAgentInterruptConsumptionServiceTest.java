@@ -1,5 +1,10 @@
 package com.koawa.agent.agent.checkpoint;
 
+import com.koawa.agent.agent.checkpoint.resume.*;
+import com.koawa.agent.agent.checkpoint.snapshot.AgentCheckpointStore;
+import com.koawa.agent.agent.checkpoint.snapshot.AgentTaskSnapshotJsonCodec;
+import com.koawa.agent.agent.checkpoint.snapshot.AgentTaskSnapshotMapper;
+import com.koawa.agent.agent.checkpoint.snapshot.JdbcAgentCheckpointStore;
 import com.koawa.agent.agent.domain.AgentActionType;
 import com.koawa.agent.agent.domain.AgentStopReason;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot;
@@ -151,9 +156,9 @@ class PostgresAgentInterruptConsumptionServiceTest {
                 )),
                 List.of(),
                 Map.of(
-                        AgentTaskSnapshotMapper.STOP_REASON,
+                        "stopReason",
                         AgentStopReason.ASK_CLARIFICATION.name(),
-                        AgentTaskSnapshotMapper.FINAL_ANSWER,
+                        "finalAnswer",
                         "Which repository?"
                 ),
                 new PendingInterrupt(

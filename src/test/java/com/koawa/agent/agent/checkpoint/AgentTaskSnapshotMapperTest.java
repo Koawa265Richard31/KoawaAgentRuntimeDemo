@@ -1,5 +1,6 @@
 package com.koawa.agent.agent.checkpoint;
 
+import com.koawa.agent.agent.checkpoint.snapshot.AgentTaskSnapshotMapper;
 import com.koawa.agent.agent.domain.AgentAction;
 import com.koawa.agent.agent.domain.AgentActionType;
 import com.koawa.agent.agent.domain.AgentFailureType;
@@ -194,7 +195,7 @@ class AgentTaskSnapshotMapperTest {
                 List.of(),
                 List.of(),
                 Map.of(
-                        AgentTaskSnapshotMapper.PLANNING_RECOVERY_ATTEMPTS,
+                        "planningRecoveryAttempts",
                         "invalid"),
                 null,
                 CREATED_AT,

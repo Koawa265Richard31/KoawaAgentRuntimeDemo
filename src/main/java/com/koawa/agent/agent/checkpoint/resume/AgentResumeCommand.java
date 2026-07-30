@@ -1,4 +1,4 @@
-package com.koawa.agent.agent.checkpoint;
+package com.koawa.agent.agent.checkpoint.resume;
 
 /**
  * Immutable request to assess whether a persisted task may be resumed.

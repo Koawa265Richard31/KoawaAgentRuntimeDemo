@@ -1,5 +1,6 @@
 package com.koawa.agent.agent.checkpoint;
 
+import com.koawa.agent.agent.checkpoint.snapshot.AgentTaskSnapshotJsonCodec;
 import com.koawa.agent.agent.domain.AgentActionType;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.InterruptType;
