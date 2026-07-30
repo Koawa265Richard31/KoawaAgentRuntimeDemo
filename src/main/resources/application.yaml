@@ -16,6 +16,10 @@ agent:
     max-steps: ${AGENT_MAX_STEPS:8}
     turn-timeout: ${AGENT_TURN_TIMEOUT:120s}
     allowed-tool-ids: ${AGENT_ALLOWED_TOOL_IDS:}
+  checkpoint:
+    execution:
+      lease-duration: ${AGENT_LEASE_DURATION:30s}
+      renew-interval: ${AGENT_LEASE_RENEW_INTERVAL:10s}
   llm:
     base-url: ${SILICONFLOW_BASE_URL:https://api.siliconflow.cn/v1}
     api-key: ${SILICONFLOW_API_KEY:}

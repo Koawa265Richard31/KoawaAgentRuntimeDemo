@@ -2205,3 +2205,260 @@ Fencing 窗口被关闭。
 
 下一步是 `M0-S4e`：组合 Resume Evaluate/Interrupt Consume、Acquire、Snapshot Restore、
 Lease Session 和 Fenced Lifecycle，验证两个并发 Resume 只有一个进入执行阶段。
+
+## 2026-07-31：M0-S4e Resume Claim 组合用例
+
+### 本切片目标
+
+本切片把此前分散的 Resume 能力组合成一个应用用例：
+
+```text
+RUNNING
+  → Evaluate
+  → Acquire(expectedRevision)
+  → Restore
+  → Start Lease Session
+  → 返回可执行上下文
+
+WAITING_FOR_INPUT
+  → Evaluate
+  → Consume Interrupt（revision N → N + 1）
+  → Acquire(revision N + 1)
+  → Restore
+  → Start Lease Session
+  → 返回可执行上下文
+```
+
+本切片仍不运行 Agent Loop，不增加 REST Controller，不修改 Snapshot JSON、Flyway、
+Provider 或 Tool Ledger。M0-S5 的 API 层只需要消费本用例的明确结果，不应自行重新拼装
+Evaluate、Consume、Acquire 顺序。
+
+### 为什么增加 AgentResumeClaimService
+
+此前每个服务只负责一个局部动作：
+
+- `AgentResumeService`：只读判断当前状态是否允许 Resume。
+- `AgentInterruptConsumptionService`：消费 USER_INPUT Interrupt，并把任务推进到新的
+  RUNNING revision。
+- `AgentExecutionLeaseStore`：基于 taskId + expectedRevision 取得执行权。
+- `AgentSnapshotRecoveryService`：从 Snapshot 恢复可变 `AgentState`。
+- `AgentExecutionLeaseSession`：续租并记录 Lease Lost。
+- `PersistentAgentCheckpointLifecycle`：在 Step/终态边界执行 fenced write。
+
+如果由 Controller 逐个调用这些服务，RUNNING 和 WAITING 两条路径很容易出现顺序差异，
+也容易忘记失败后的 Lease 清理。`AgentResumeClaimService` 将顺序固定为一个应用层用例，
+但它不把 HTTP、模型调用或 Agent Loop 塞进 Checkpoint 模块。
+
+核心分支如下：
+
+```java
+AgentResumeResult decision = resumeService.evaluate(command);
+if (!decision.accepted()) {
+    return new AgentResumeClaimResult.Rejected(decision);
+}
+
+long claimRevision = switch (decision.nextAction()) {
+    case ACQUIRE_EXECUTION_CLAIM -> decision.revision();
+    case CONSUME_USER_INPUT_INTERRUPT ->
+            consumptionService.consume(command).snapshot().revision();
+    case REJECT -> throw new IllegalStateException(...);
+};
+return claimRunning(command.taskId(), claimRevision);
+```
+
+WAITING 路径不能继续拿旧 revision 申请 Lease。Interrupt 消费已经产生一个包含用户回复的
+新 RUNNING Snapshot，因此 Acquire 必须校验这个新 revision；否则执行者恢复到的状态可能
+不包含刚提交的用户输入。
+
+### 三种显式结果
+
+`AgentResumeClaimResult` 使用 sealed interface 表达三个互斥结果：
+
+| 结果 | 含义 | 是否可进入 Agent Loop |
+|---|---|---|
+| `Claimed` | 已恢复 State，并持有活跃 Lease Session | 是 |
+| `Rejected` | 状态矩阵拒绝了当前 Resume 命令 | 否 |
+| `Recovered` | 恢复过程补齐了遗漏的 terminal 状态 | 否 |
+
+`Recovered` 不能与 `Rejected` 合并。例子：
+
+```text
+revision 7:
+  status = RUNNING
+  lastStep = FINAL_ANSWER
+
+Resume:
+  Acquire token 4
+  → 恢复时发现 terminal Step
+  → fenced repair 为 revision 8 / COMPLETED
+  → Release token 4
+  → 返回 Recovered
+```
+
+这个请求不是因为状态矩阵不允许而被拒绝；它实际完成了一次必要的持久化修复，但不应再
+进入 Agent Loop。
+
+### AgentClaimedExecution 的职责
+
+`AgentClaimedExecution` 把以下三个必须一起使用的对象绑定起来：
+
+```text
+恢复后的 AgentState
+  + 恢复来源 AgentTaskSnapshot
+  + 使用同一 Lease Session 的 Fenced Checkpoint Lifecycle
+```
+
+它实现 `AutoCloseable`。未来 API/运行编排应使用：
+
+```java
+try (AgentClaimedExecution execution = claimed.execution()) {
+    execution.requireActive();
+    // 使用 execution.state() 和 execution.checkpointLifecycle()
+}
+```
+
+关闭上下文会停止 Heartbeat，并尽力 Release Lease。对象不暴露
+`AgentExecutionPermit`，因此上层拿不到 ownerId，也不能绕过 Session 直接拼装一个 Permit。
+
+### 恢复修复为什么也要 Fencing
+
+`AgentSnapshotRecoveryService` 原有的 terminal repair 会写一次 Checkpoint。如果组合
+Resume 已经先 Acquire，但 repair 仍调用普通 `AgentCheckpointStore.save()`，就会出现：
+
+```text
+Worker A 取得 token 8
+  → A 的 Lease 过期
+Worker B 取得 token 9
+  → A 才执行 terminal repair
+```
+
+此时只有 revision CAS 不足以证明 A 仍有写入资格。因此 Recovery 新增 Permit-aware
+重载；只要由 Resume Claim 调用，terminal repair 就通过
+`AgentFencedCheckpointWriter` 同时验证 revision、owner、token 和 Lease 有效期。旧的无
+Permit 重载继续保留，兼容 M0-S2 的独立恢复测试和非 Resume 调用。
+
+### 失败清理边界
+
+Acquire 成功后的任一步骤都可能失败，例如 Snapshot 在加载时发生 revision conflict、
+恢复映射失败，或 Session 配置非法。组合服务遵守：
+
+```text
+Acquire 成功
+  → 尚未创建 Session 时失败：直接尽力 Release Permit
+  → Session 已创建后失败：关闭 Session
+  → Release 失败：记录 taskId + fencingToken，不覆盖原异常
+```
+
+业务拒绝发生在 Acquire 之前，因此不会创建 Lease。`Claimed` 返回后，Lease 生命周期转交
+给 `AgentClaimedExecution`，由调用者关闭。
+
+### 配置
+
+新增两个可绑定的运维配置，默认值来自 ADR-003：
+
+```yaml
+agent:
+  checkpoint:
+    execution:
+      lease-duration: ${AGENT_LEASE_DURATION:30s}
+      renew-interval: ${AGENT_LEASE_RENEW_INTERVAL:10s}
+```
+
+`renewInterval` 必须小于 `leaseDuration`，两者至少为 1 毫秒。30/10 秒只是默认运维值，
+测试仍使用显式配置，不等待真实 Lease 周期。
+
+### 并发证明
+
+内存组合测试使用两个线程和两个 Latch 同时发起相同的：
+
+```text
+taskId = concurrent-task
+expectedRevision = 0
+```
+
+测试保留成功方的 `AgentClaimedExecution`，使其 Lease 在另一个请求竞争时仍然有效。最终
+结果必须严格为：
+
+```text
+1 × AgentResumeClaimResult.Claimed
+1 × AgentExecutionConflictException
+```
+
+没有使用 `sleep()` 推测竞争窗口。
+
+另增加真实 PostgreSQL/Testcontainers 组合测试。两个 Worker 使用独立
+`JdbcTemplate/JdbcAgentExecutionLeaseStore`，验证相同 Resume 只有一个进入执行上下文。
+
+### 已执行确认
+
+- `AgentResumeClaimServiceTest`：6 tests，0 failures，0 errors，0 skipped。
+- 相关 Resume/Recovery/Lease/Fenced Lifecycle：40 tests，0 failures，0 errors，
+  0 skipped。
+- 全量回归：156 tests，0 failures，0 errors，14 skipped。
+- Spring Context 已成功创建 JDBC Lease Store、Fenced Writer、Resume 组件和组合服务。
+
+### 尚未验证
+
+- `PostgresAgentResumeClaimServiceTest` 的 1 个真实 PostgreSQL 并发用例已编译，但当前
+  Docker 不可用，因此被 skipped。
+- 全量 14 个 skipped 均为 PostgreSQL/Testcontainers 用例。
+- 因此本轮已通过内存组件测试证明组合顺序和结果分类，但不能宣称真实 PostgreSQL 的完整
+  并发 Resume 已在本机执行确认。
+- 按项目负责人此前指令，本切片不回到 M0-S4a 处理中断主线的 Docker 兼容性问题。
+
+### 面试问题
+
+#### 问题一：为什么 Evaluate 通过后还必须在 Acquire 中再次校验 revision？
+
+参考回答：
+
+Evaluate 是状态矩阵判断，不授予执行权。它读取 revision 7 后，其他请求可能已经把
+Checkpoint 推进到 revision 8。Acquire 必须把 expectedRevision 放进原子 Claim 条件；
+否则一个基于过时状态作出决定的请求仍可能取得 Lease。
+
+#### 问题二：WAITING_FOR_INPUT 为什么先 Consume，再 Acquire？
+
+参考回答：
+
+用户输入属于需要持久化的业务状态。Consume 通过 CAS 一次性清除 Interrupt、追加用户消息，
+并产生新的 RUNNING revision。随后对新 revision Acquire，保证执行者恢复的正是包含这次
+输入的状态。两个相同提交并发时，也会先在 Consume CAS 上淘汰一个。
+
+#### 问题三：为什么 AgentClaimedExecution 要实现 AutoCloseable？
+
+参考回答：
+
+它表示一项有生命周期的资源所有权，而不只是普通 DTO。成功返回后 Heartbeat 已启动，
+调用者必须在完成、失败或取消时停止续租并 Release。AutoCloseable 允许用
+try-with-resources 把清理路径固定下来，避免 Controller 的多个 return/exception 分支漏掉
+Release。
+
+#### 问题四：为什么不把 Permit 直接返回给 Controller？
+
+参考回答：
+
+Permit 中包含 ownerId、fencingToken 和有效期，是内部执行权凭据。Controller 只需要
+AgentState 和受 Fence 保护的生命周期。封装 Permit 可以减少泄露 ownerId、使用旧 Permit
+写入、或绕过 Heartbeat Session 的机会。
+
+#### 问题五：为什么 terminal repair 也必须使用 Fenced Write？
+
+参考回答：
+
+terminal repair 同样会推进业务 revision。只要这次写发生在 Resume Acquire 之后，它就
+属于某一代 Worker 的执行结果。如果只做 revision CAS，Lease 过期后的旧 Worker仍可能在新
+Worker 接管前后提交修复；Fencing 才能证明写入者仍持有当前执行权。
+
+#### 问题六：并发测试为什么要让成功方保持未关闭？
+
+参考回答：
+
+如果第一个请求一返回就关闭并 Release，第二个请求可能合法取得更大的 Token，测试结果会变
+成两个顺序成功，而不是验证“活跃执行期间只有一个 Worker”。保留成功方上下文直到两个请求
+都完成，才能准确覆盖未过期 Lease 冲突。
+
+### 下一切片
+
+M0-S4 到此完成。下一阶段是 `M0-S5`：Task 查询、Resume REST API、错误映射、真实
+PostgreSQL 重启恢复 E2E 和会话历史持久化。该范围明显大于单切片文件上限，开始前应先按
+API 合同、运行编排、PostgreSQL E2E、Conversation Store 拆分为可独立验收的子切片。

@@ -1,6 +1,8 @@
 package com.koawa.agent.agent.checkpoint.resume;
 
+import com.koawa.agent.agent.checkpoint.lease.AgentExecutionPermit;
 import com.koawa.agent.agent.checkpoint.snapshot.AgentCheckpointStore;
+import com.koawa.agent.agent.checkpoint.snapshot.AgentFencedCheckpointWriter;
 import com.koawa.agent.agent.checkpoint.snapshot.AgentTaskSnapshotMapper;
 import com.koawa.agent.agent.domain.AgentActionType;
 import com.koawa.agent.agent.domain.AgentState;
@@ -34,6 +36,7 @@ public final class AgentSnapshotRecoveryService {
     private final AgentTaskSnapshotMapper mapper;
     private final Clock clock;
     private final Supplier<String> interruptIdSupplier;
+    private final AgentFencedCheckpointWriter fencedWriter;
 
     public AgentSnapshotRecoveryService(
             AgentCheckpointStore store,
@@ -43,7 +46,8 @@ public final class AgentSnapshotRecoveryService {
                 store,
                 mapper,
                 Clock.systemUTC(),
-                () -> UUID.randomUUID().toString()
+                () -> UUID.randomUUID().toString(),
+                null
         );
     }
 
@@ -52,6 +56,37 @@ public final class AgentSnapshotRecoveryService {
             AgentTaskSnapshotMapper mapper,
             Clock clock,
             Supplier<String> interruptIdSupplier
+    ) {
+        this(
+                store,
+                mapper,
+                clock,
+                interruptIdSupplier,
+                null
+        );
+    }
+
+    public AgentSnapshotRecoveryService(
+            AgentCheckpointStore store,
+            AgentTaskSnapshotMapper mapper,
+            Clock clock,
+            AgentFencedCheckpointWriter fencedWriter
+    ) {
+        this(
+                store,
+                mapper,
+                clock,
+                () -> UUID.randomUUID().toString(),
+                fencedWriter
+        );
+    }
+
+    public AgentSnapshotRecoveryService(
+            AgentCheckpointStore store,
+            AgentTaskSnapshotMapper mapper,
+            Clock clock,
+            Supplier<String> interruptIdSupplier,
+            AgentFencedCheckpointWriter fencedWriter
     ) {
         this.store = Objects.requireNonNull(
                 store,
@@ -69,11 +104,23 @@ public final class AgentSnapshotRecoveryService {
                 interruptIdSupplier,
                 "interruptIdSupplier cannot be null"
         );
+        this.fencedWriter = fencedWriter;
     }
 
     public AgentSnapshotRecoveryResult restore(
             String taskId,
             long expectedRevision
+    ) {
+        return restore(taskId, expectedRevision, null);
+    }
+
+    /**
+     * Restores a claimed task and fences any terminal-boundary repair.
+     */
+    public AgentSnapshotRecoveryResult restore(
+            String taskId,
+            long expectedRevision,
+            AgentExecutionPermit permit
     ) {
         String actualTaskId = requireTaskId(taskId);
         if (expectedRevision < 0) {
@@ -112,7 +159,7 @@ public final class AgentSnapshotRecoveryService {
             );
         }
 
-        return repairTerminalStep(snapshot, state, lastStep);
+        return repairTerminalStep(snapshot, state, lastStep, permit);
     }
 
     private boolean isConsumedClarificationBoundary(
@@ -128,7 +175,8 @@ public final class AgentSnapshotRecoveryService {
     private AgentSnapshotRecoveryResult repairTerminalStep(
             AgentTaskSnapshot current,
             AgentState state,
-            StepSnapshot terminalStep
+            StepSnapshot terminalStep,
+            AgentExecutionPermit permit
     ) {
         if (current.revision() == Long.MAX_VALUE) {
             throw new IllegalStateException(
@@ -171,10 +219,21 @@ public final class AgentSnapshotRecoveryService {
                 current.createdAt(),
                 updatedAt
         );
-        AgentTaskSnapshot saved = store.save(
-                repaired,
-                current.revision()
-        );
+        AgentTaskSnapshot saved;
+        if (permit == null) {
+            saved = store.save(repaired, current.revision());
+        } else {
+            if (fencedWriter == null) {
+                throw new IllegalStateException(
+                        "fenced checkpoint writer is not configured"
+                );
+            }
+            saved = fencedWriter.save(
+                    repaired,
+                    current.revision(),
+                    permit
+            );
+        }
 
         return new AgentSnapshotRecoveryResult(
                 saved,
