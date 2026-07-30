@@ -1832,3 +1832,213 @@ Resume、Lease 分包能够直接表达不同的一致性职责，使 JDBC Lease
 
 下一步仍是 `M0-S4c`：在 `checkpoint.lease` 中增加 JDBC Lease Store，并通过 Flyway V2
 增加独立 Lease 表。
+
+## 2026-07-30：M0-S4c PostgreSQL Lease Store
+
+### 本切片目标
+
+本切片把 M0-S4b 的 Lease 协议落实到独立数据库表和 JDBC Store：
+
+```text
+Flyway V2
+  → agent_execution_lease
+  → JdbcAgentExecutionLeaseStore
+  → PostgreSQL 并发、过期、接管测试
+```
+
+本切片仍不接 Resume/Agent Loop，不启动心跳，也不实现 Permit-aware Checkpoint Write。
+
+### 为什么使用独立表
+
+V2 新增：
+
+```text
+agent_execution_lease
+├── task_id             PK + FK → agent_checkpoint
+├── owner_id
+├── fencing_token
+├── lease_expires_at
+└── updated_at
+```
+
+`task_id` 是主键，因此一个任务最多只有一条 Lease 记录。外键使用 `ON DELETE CASCADE`：
+管理员明确删除 Checkpoint 时，对应 Lease 一并清理；正常 Release 不删除 Lease 行。
+
+Lease 没有加入 Snapshot JSON。这样 Renew 不会制造新的 Checkpoint revision，旧 Snapshot
+也不需要升级 schemaVersion。
+
+### Acquire 为什么是一条 SQL
+
+核心结构：
+
+```sql
+INSERT INTO agent_execution_lease (...)
+SELECT ...
+FROM agent_checkpoint
+WHERE task_id = ?
+  AND revision = ?
+ON CONFLICT (task_id) DO UPDATE
+SET owner_id = EXCLUDED.owner_id,
+    fencing_token = current_lease.fencing_token + 1,
+    lease_expires_at = EXCLUDED.lease_expires_at
+WHERE current_lease.lease_expires_at
+        <= statement_timestamp()
+RETURNING ...;
+```
+
+这条语句同时表达：
+
+```text
+Checkpoint 必须存在
+Checkpoint revision 必须匹配
+Lease 不存在时插入 Token 1
+Lease 已过期时原子接管并令 Token + 1
+Lease 未过期时不返回记录
+```
+
+不能在 Java 中先 `SELECT Lease` 再 `INSERT/UPDATE`，否则两个数据库连接可能同时看到“没有
+Lease”，随后都尝试取得执行权。PostgreSQL 的唯一键冲突处理和条件更新把竞争放在数据库
+中完成。
+
+Acquire 只持有单条 SQL 的短事务，不跨模型或工具调用占用数据库连接。
+
+### 为什么使用数据库时间
+
+Acquire、Renew 和 Release 都使用：
+
+```sql
+statement_timestamp()
+```
+
+Worker 只传 `leaseDuration`，不传“当前时间”。这样多台机器即使系统时钟有偏差，数据库仍
+使用同一个时间源判断 Lease 是否过期。
+
+首版 JDBC 精度为毫秒：
+
+```text
+expiresAt = statement_timestamp()
+            + leaseDurationMillis
+```
+
+小于 1 毫秒的 Duration 被明确拒绝。Store 返回的 Permit 使用数据库 `RETURNING` 提供的
+真实 `lease_expires_at`，不是 Worker 本地推算值。
+
+### Renew
+
+Renew 使用条件更新：
+
+```sql
+UPDATE agent_execution_lease
+SET lease_expires_at = databaseNow + duration,
+    updated_at = databaseNow
+WHERE task_id = ?
+  AND owner_id = ?
+  AND fencing_token = ?
+  AND lease_expires_at > databaseNow
+RETURNING ...;
+```
+
+必须同时匹配 Owner 和 Token，且 Lease 仍未过期。过期 Lease 不能通过 Renew 复活，只能
+停止当前 Worker，由新的 Acquire 产生更大的 Token。
+
+### Release
+
+Release 不删除行，而是：
+
+```sql
+SET lease_expires_at = statement_timestamp()
+```
+
+下一次 Acquire 可以立即接管，并基于保留的 Token 历史执行 `Token + 1`。Release 同样要求
+Owner、Token 和未过期状态匹配，旧 Permit 不能释放新 Worker 的 Lease。
+
+### 失败分类
+
+Acquire 没有返回 Permit 时，Store 查询最新数据库状态并分类：
+
+- Checkpoint 不存在：`CheckpointNotFoundException`。
+- revision 不匹配：`CheckpointConflictException`。
+- Checkpoint 匹配但存在 Lease：`AgentExecutionConflictException`。
+
+Renew/Release 影响 0 行时：
+
+- Lease 行不存在：`LEASE_MISSING`。
+- Owner 或 Token 不匹配：`OWNER_OR_TOKEN_MISMATCH`。
+- Owner 和 Token 匹配但条件更新失败：`LEASE_EXPIRED`。
+
+失败后的补充查询用于产生可诊断异常；真正决定是否取得或保持执行权的是前面的原子条件
+SQL，不能根据补充查询结果绕过并重新写入。
+
+### PostgreSQL 测试设计
+
+新增 5 个真实 PostgreSQL 场景：
+
+1. Acquire、Renew、Release 后再次 Acquire 返回 Token 2，Checkpoint revision 不变化。
+2. 任务不存在、revision 过期、Lease 未过期分别返回对应冲突。
+3. 强制 Lease 过期后允许接管，旧 Permit 的 Renew/Release 被 Fencing 拒绝。
+4. 两个独立 Acquire 并发竞争时只有一个成功。
+5. 删除 Checkpoint 时通过外键级联清理 Lease。
+
+过期测试直接修改数据库过期时间，不使用 `sleep(30s)`，避免慢测试和时间抖动。
+
+### 已执行确认
+
+- Java 生产代码和 PostgreSQL 测试代码编译通过。
+- `KoawaAgentApplicationTest` 通过，Flyway 在 H2 验证环境中从 V1 成功迁移到 V2。
+- 全量回归：138 tests，0 failures，0 errors，11 skipped。
+
+### 尚未验证
+
+- 新增的 5 个 `PostgresJdbcAgentExecutionLeaseStoreTest` 因当前 Docker 不可用被跳过。
+- 因此本轮不能宣称 Acquire SQL、PostgreSQL 并发接管或数据库时间语义已经在本机实际
+  执行确认。
+- 现有另外 6 个 PostgreSQL/Testcontainers 测试也继续跳过。
+
+根据项目负责人的指令，本轮不回到 M0-S4a 处理 Docker/Testcontainers 环境，保持上述限制
+并继续主线。
+
+### 面试问题
+
+#### 问题一：为什么 Acquire 要使用 INSERT SELECT？
+
+参考回答：
+
+`INSERT SELECT` 只有在对应 Checkpoint 存在且 revision 匹配时才产生待插入行，因此任务
+资格检查与 Lease 写入处于同一条数据库语句中。若先在 Java 中查询 revision，再单独写
+Lease，中间会留下状态变化窗口。
+
+#### 问题二：为什么不用 SELECT FOR UPDATE 后一直持锁？
+
+参考回答：
+
+模型和工具调用可能持续数十秒甚至数分钟。跨调用持有行锁和数据库事务会长期占用连接、
+增加死锁与故障恢复成本。Lease 只在 Acquire/Renew/Release 时执行短事务，运行期间通过
+持久化过期时间表达所有权。
+
+#### 问题三：为什么由数据库计算 expiresAt？
+
+参考回答：
+
+多个 Worker 的本地时钟可能漂移。如果 A 用自己的时钟写过期时间、B 用另一台机器的时钟
+判断是否过期，会产生提前接管或延迟恢复。数据库时间使所有权判断使用单一时间源。
+
+#### 问题四：为什么 Release 也必须检查 fencingToken？
+
+参考回答：
+
+A 的 Lease 过期后 B 可能已经以更大的 Token 接管。如果 A 的迟到 Release 只按 taskId
+更新，就会把 B 的 Lease 误标记为过期。Owner 和 Token 条件确保 Release 只能作用于调用者
+持有的那一代执行权。
+
+#### 问题五：为什么 PostgreSQL 测试不能由 H2 代替？
+
+参考回答：
+
+本设计依赖 PostgreSQL 的 `ON CONFLICT DO UPDATE ... WHERE`、并发唯一键竞争、
+`statement_timestamp()`、`RETURNING` 和时区精度。H2 能验证迁移结构和 Spring 启动，但
+不能证明这些 PostgreSQL 并发与时间语义。
+
+### 下一切片
+
+下一步是 `M0-S4d`：增加 Permit-aware Checkpoint Write、Lease Session/Heartbeat 和
+Lease Lost 停止边界。M0-S4c 到此停止，不提前连接 Resume 入口。
