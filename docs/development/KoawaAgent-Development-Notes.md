@@ -1573,3 +1573,205 @@ PostgreSQL 验证：
 ### 下一切片
 
 按执行计划停止在 M0-S3。下一步是 `M0-S4：执行权租约或 CAS Claim`，本轮不继续实现。
+
+## 2026-07-30：M0-S4b Lease 领域协议与内存 Store
+
+### 本切片目标
+
+项目负责人批准 `ADR-003` 并要求先进入 Lease 主线，因此暂时跳过只处理
+Docker/Testcontainers 兼容性的 M0-S4a。本切片只实现：
+
+```text
+AgentExecutionPermit
+  → AgentExecutionLeaseStore
+  → InMemoryAgentExecutionLeaseStore
+  → 确定性时间与并发测试
+```
+
+本切片不增加数据库表，不实现 JDBC Lease Store，不接 Resume/Agent Loop，也不实现心跳
+线程。
+
+### Permit 表达什么
+
+`AgentExecutionPermit` 是 Store 成功授予执行权后返回的不可变凭证：
+
+```text
+taskId         哪个任务
+ownerId        哪一次执行尝试
+fencingToken   这是第几代执行权
+expiresAt      这份执行权何时失效
+```
+
+它的构造器保持 package-private。普通调用者只能从 `acquire()` 得到 Permit，不能直接传入一个
+更大的 Token 来伪造执行权。
+
+`toString()` 刻意不输出 `ownerId`。ownerId 用于内部所有权匹配，不是认证凭据，也不应该因
+异常日志或调试输出被完整暴露。
+
+### Store 协议
+
+```java
+AgentExecutionPermit acquire(
+        String taskId,
+        long expectedRevision,
+        Duration leaseDuration
+);
+
+AgentExecutionPermit renew(
+        AgentExecutionPermit permit,
+        Duration leaseDuration
+);
+
+void release(AgentExecutionPermit permit);
+
+Optional<AgentExecutionPermit> load(String taskId);
+```
+
+`acquire()` 不接收 ownerId。Store 使用随机 ID 生成器创建新的执行尝试身份；内存实现允许
+注入 `Supplier<String>`，只是为了让测试可重复。
+
+`load()` 会返回最近一条记录，即使它已经过期或被释放。原因是 Token 历史不能删除：
+下一次 Acquire 必须从旧 Token 加 1，而不是重新从 1 开始。
+
+### Acquire 如何流转
+
+```text
+校验 taskId、expectedRevision、leaseDuration
+  → 加载 Checkpoint
+  → Checkpoint 不存在：CheckpointNotFoundException
+  → revision 不匹配：CheckpointConflictException
+  → 原子检查当前 Lease
+  → 未过期：AgentExecutionConflictException
+  → 不存在：创建 token 1
+  → 已过期/已释放：创建 token N + 1
+  → 返回新的 Permit
+```
+
+内存 Store 使用 `ConcurrentHashMap.compute()`，因此同一个 taskId 的两个 Acquire 不会同时
+创建成功。
+
+### Renew 与 Release
+
+续租和释放都必须匹配：
+
+```text
+taskId + ownerId + fencingToken
+```
+
+并且 Lease 必须仍然有效。失败时抛出
+`AgentExecutionLeaseLostException`，原因分为：
+
+- `LEASE_MISSING`：任务没有 Lease 记录。
+- `OWNER_OR_TOKEN_MISMATCH`：执行权已经属于另一代或另一个 Owner。
+- `LEASE_EXPIRED`：当前 Permit 已经过期，不能通过 Renew 复活。
+
+`release()` 不删除记录，只把 `expiresAt` 缩短到当前时间。下一次 Acquire 因此可以立刻
+接管，同时获得更大的 Token。
+
+### Fencing 解决什么问题
+
+示例：
+
+```text
+A acquire → token 1
+A 暂停超过租期
+B takeover → token 2
+A 恢复并尝试 renew/release
+→ OWNER_OR_TOKEN_MISMATCH
+```
+
+即使 A 和 B 在物理上短暂同时运行，数据库也只会承认 Token 2。M0-S4d 会把同样的检查
+加入 Checkpoint Write，从而拒绝 A 的迟到状态写入。
+
+### 为什么 Lease 不修改 Checkpoint revision
+
+Checkpoint revision 表示任务业务进度；Lease 表示运行协调状态。如果每次心跳都更新
+Snapshot：
+
+- revision 会在没有完成任何 Step 时持续增长。
+- Resume 客户端会频繁遇到无意义的 revision conflict。
+- 任务恢复数据与 Worker 存活状态会被错误耦合。
+
+因此内存 Store 独立保存 Lease，Acquire、Renew、Release 后原 Checkpoint revision 保持
+不变。
+
+### 内存实现的验证边界
+
+`ConcurrentHashMap.compute()` 只能证明单 JVM 内同一 taskId 的 Lease 转换是原子的。
+Checkpoint revision 的读取与 Lease map 更新不是一个跨 Store 事务，不能用它宣称
+PostgreSQL 上的 Acquire 已经原子化。
+
+M0-S4c 必须通过同一数据库事务或条件 SQL，把以下条件放进真实 PostgreSQL 语义中：
+
+```text
+checkpoint exists
+checkpoint.revision == expectedRevision
+lease missing or expired
+```
+
+### 测试结果
+
+已执行确认：
+
+- `InMemoryAgentExecutionLeaseStoreTest`：6 tests，0 failures，0 errors，0 skipped。
+- checkpoint 包回归：54 tests，0 failures，0 errors，6 skipped。
+- 全量回归：133 tests，0 failures，0 errors，6 skipped。
+
+新增测试覆盖：
+
+- 首次 Acquire 返回 Token 1。
+- 未过期时第二个 Acquire 明确冲突。
+- 当前 Owner 可以 Renew 和 Release。
+- Release 后重新 Acquire 返回 Token 2。
+- 过期后接管返回 Token 2。
+- 旧 Permit 不能 Renew 或 Release 新 Lease。
+- 两个并发 Acquire 只有一个成功。
+- Acquire/Renew/Release 不修改 Checkpoint revision。
+- Permit 的默认字符串表示不泄露 ownerId。
+
+6 个 skipped 仍是现有 PostgreSQL/Testcontainers 用例；按项目负责人的本轮指令，没有处理
+Docker 测试基础设施。
+
+### 面试问题
+
+#### 问题一：为什么 Checkpoint revision 不能代替 Lease？
+
+参考回答：
+
+revision CAS 只能在保存状态时发现冲突。两个 Worker 可能已经同时读取 revision 7，并在
+任何一个保存前都调用了模型或工具。Lease 把冲突提前到进入执行阶段之前；后续 Fenced
+Write 再防止租约过期后的旧 Worker 写回。
+
+#### 问题二：为什么 Lease 需要过期，而不是永久 Claim？
+
+参考回答：
+
+永久 Claim 在持有进程崩溃后不会自动释放，任务会永久卡住。可续租 Lease 把“持有者仍然
+存活”变成有限时间承诺；心跳停止后，其他 Worker 可以在到期后接管。
+
+#### 问题三：为什么同时需要 ownerId 和 fencingToken？
+
+参考回答：
+
+ownerId 区分同一代执行权由哪个执行尝试持有；fencingToken 表达执行权代数。接管后 Token
+严格递增，因此旧 Worker 即使恢复并继续持有旧对象，也会因为 Token 落后而被拒绝。
+
+#### 问题四：为什么 Release 不直接删除 Lease？
+
+参考回答：
+
+删除会丢失上一代 Token。下一次 Acquire 如果重新从 Token 1 开始，旧 Worker 的 Token 1
+可能再次与当前值相同。保留记录并把它标记为过期，可以让下一代稳定递增到 Token 2。
+
+#### 问题五：Lease 能保证外部工具 Exactly Once 吗？
+
+参考回答：
+
+不能。Lease 能阻止旧 Worker 更新 KoawaAgent 内部状态，但不能撤销已经发出的 HTTP、
+Shell、Git 或 MCP 操作。外部副作用仍需要稳定 toolCallId、幂等键、结果查询、Tool Ledger
+或 `OUTCOME_UNKNOWN` 人工处理。
+
+### 下一切片
+
+下一步是 `M0-S4c`：增加 Flyway V2 和 JDBC Lease Store，把 Acquire/Renew/Release 与
+Checkpoint revision 条件落实到 PostgreSQL。M0-S4b 到此停止，不提前接 Agent Loop。
