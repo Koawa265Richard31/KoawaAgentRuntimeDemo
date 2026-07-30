@@ -1511,6 +1511,14 @@ PostgreSQL 验证：
 - 因此本轮不能宣称 PostgreSQL 上的一次性消费已经实际验证；Docker/CI 可用后需要运行该
   测试。
 
+2026-07-30 收口复验：
+
+- M0-S3 定向测试：18 tests，0 failures，0 errors，1 skipped。
+- checkpoint 包回归：48 tests，0 failures，0 errors，6 skipped。
+- 全量回归：127 tests，0 failures，0 errors，6 skipped。
+- Docker CLI 已安装，但本次复验无法连接 Docker Engine；6 个 PostgreSQL/Testcontainers
+  测试被跳过。默认命令下真实 PostgreSQL 测试的可复现性留给 M0-S4a 收口。
+
 尚未验证：
 
 - 两个执行者消费成功后谁取得唯一执行权。
@@ -1556,10 +1564,11 @@ PostgreSQL 验证：
 
 参考回答：
 
-它区分了“ASK_CLARIFICATION Step 已保存但等待态未落库”和“等待态已经被用户回复消费”。
-两种 Snapshot 都可能表现为最后一步 terminal 且状态 RUNNING。没有显式边界标记，重启
-恢复会错误地再次生成 Interrupt，使任务重新等待。记录 stepIndex 还能防止后续新的澄清
-Step 被旧标记跳过。
+`ASK_CLARIFICATION Step` 和 `WAITING_FOR_INPUT` 状态是分两次保存的。如果进程在两次保存之间崩溃，
+数据库会留下“`RUNNING` 且最后一步是 `ASK_CLARIFICATION`”，这表示用户还没回答。用户回答并消费 `Interrupt` 后，
+任务也会重新变成“`RUNNING` 且最后一步是 `ASK_CLARIFICATION`”，但这次表示可以继续。两种状态外观相同，
+所以用 `consumedUserInputStep` 记录具体哪个澄清 `Step` 已被回答。恢复时，`stepIndex` 匹配就继续，
+不匹配或为空就重新进入等待；记录 `stepIndex` 还能避免旧回答误伤后续的新澄清问题。
 
 ### 下一切片
 
