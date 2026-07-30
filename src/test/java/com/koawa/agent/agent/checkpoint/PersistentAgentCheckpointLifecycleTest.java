@@ -1,7 +1,11 @@
 package com.koawa.agent.agent.checkpoint;
 
+import com.koawa.agent.agent.checkpoint.lease.AgentExecutionLeaseSession;
+import com.koawa.agent.agent.checkpoint.lease.AgentExecutionPermit;
+import com.koawa.agent.agent.checkpoint.lease.InMemoryAgentExecutionLeaseStore;
 import com.koawa.agent.agent.checkpoint.snapshot.AgentCheckpointService;
 import com.koawa.agent.agent.checkpoint.snapshot.AgentTaskSnapshotMapper;
+import com.koawa.agent.agent.checkpoint.snapshot.InMemoryAgentFencedCheckpointWriter;
 import com.koawa.agent.agent.checkpoint.snapshot.InMemoryAgentCheckpointStore;
 import com.koawa.agent.agent.checkpoint.snapshot.PersistentAgentCheckpointLifecycle;
 import com.koawa.agent.agent.domain.AgentAction;
@@ -15,6 +19,7 @@ import com.koawa.agent.agent.domain.AgentTaskStatus;
 import org.junit.jupiter.api.Test;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.ArrayList;
@@ -119,6 +124,64 @@ class PersistentAgentCheckpointLifecycleTest {
                     entry.getValue(),
                     store.load(taskId).orElseThrow().status());
         }
+    }
+
+    @Test
+    void shouldUseCurrentLeaseSessionForResumedCheckpointWrites() {
+        Clock clock = Clock.fixed(NOW, ZoneOffset.UTC);
+        InMemoryAgentCheckpointStore checkpointStore =
+                new InMemoryAgentCheckpointStore();
+        AgentTaskSnapshotMapper mapper = new AgentTaskSnapshotMapper();
+        InMemoryAgentExecutionLeaseStore leaseStore =
+                new InMemoryAgentExecutionLeaseStore(
+                        checkpointStore,
+                        clock,
+                        () -> "resume-owner"
+                );
+        AgentCheckpointService fencedService =
+                new AgentCheckpointService(
+                        checkpointStore,
+                        mapper,
+                        clock,
+                        new InMemoryAgentFencedCheckpointWriter(
+                                checkpointStore,
+                                leaseStore,
+                                clock
+                        )
+                );
+        AgentState state = state("resumed-task");
+        fencedService.create(state);
+        AgentExecutionPermit permit = leaseStore.acquire(
+                state.getTaskId(),
+                0,
+                Duration.ofSeconds(30)
+        );
+
+        try (AgentExecutionLeaseSession session =
+                     AgentExecutionLeaseSession.start(
+                             leaseStore,
+                             permit,
+                             Duration.ofSeconds(30),
+                             Duration.ofSeconds(10)
+                     )) {
+            PersistentAgentCheckpointLifecycle resumedLifecycle =
+                    new PersistentAgentCheckpointLifecycle(
+                            fencedService,
+                            clock,
+                            () -> "interrupt-resume",
+                            session
+                    );
+            completeOneStep(state);
+
+            resumedLifecycle.stepCommitted(state);
+        }
+
+        assertEquals(
+                1,
+                checkpointStore.load("resumed-task")
+                        .orElseThrow()
+                        .revision()
+        );
     }
 
     private void assertCheckpoint(

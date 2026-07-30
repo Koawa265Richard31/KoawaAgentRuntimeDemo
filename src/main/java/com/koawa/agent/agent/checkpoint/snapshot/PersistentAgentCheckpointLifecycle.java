@@ -1,12 +1,14 @@
 package com.koawa.agent.agent.checkpoint.snapshot;
 
+import com.koawa.agent.agent.checkpoint.lease.AgentExecutionLeaseSession;
 import com.koawa.agent.agent.domain.AgentState;
 import com.koawa.agent.agent.domain.AgentStopReason;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.InterruptType;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.PendingInterrupt;
 import com.koawa.agent.agent.domain.AgentTaskStatus;
-import com.koawa.agent.agent.runner.AgentCheckpointLifecycle;
 import com.koawa.agent.agent.exception.AgentCheckpointLifecycleException;
+import com.koawa.agent.agent.exception.AgentExecutionLeaseLostException;
+import com.koawa.agent.agent.runner.AgentCheckpointLifecycle;
 
 import java.time.Clock;
 import java.util.Map;
@@ -23,6 +25,7 @@ public final class PersistentAgentCheckpointLifecycle
     private final AgentCheckpointService checkpointService;
     private final Clock clock;
     private final Supplier<String> interruptIdSupplier;
+    private final AgentExecutionLeaseSession leaseSession;
 
     public PersistentAgentCheckpointLifecycle(
             AgentCheckpointService checkpointService,
@@ -31,7 +34,8 @@ public final class PersistentAgentCheckpointLifecycle
         this(
                 checkpointService,
                 clock,
-                () -> UUID.randomUUID().toString()
+                () -> UUID.randomUUID().toString(),
+                null
         );
     }
 
@@ -40,6 +44,36 @@ public final class PersistentAgentCheckpointLifecycle
             Clock clock,
             Supplier<String> interruptIdSupplier
     ) {
+        this(
+                checkpointService,
+                clock,
+                interruptIdSupplier,
+                null
+        );
+    }
+
+    public PersistentAgentCheckpointLifecycle(
+            AgentCheckpointService checkpointService,
+            Clock clock,
+            AgentExecutionLeaseSession leaseSession
+    ) {
+        this(
+                checkpointService,
+                clock,
+                () -> UUID.randomUUID().toString(),
+                Objects.requireNonNull(
+                        leaseSession,
+                        "leaseSession cannot be null"
+                )
+        );
+    }
+
+    public PersistentAgentCheckpointLifecycle(
+            AgentCheckpointService checkpointService,
+            Clock clock,
+            Supplier<String> interruptIdSupplier,
+            AgentExecutionLeaseSession leaseSession
+    ) {
         this.checkpointService = Objects.requireNonNull(
                 checkpointService,
                 "checkpointService cannot be null");
@@ -47,6 +81,7 @@ public final class PersistentAgentCheckpointLifecycle
         this.interruptIdSupplier = Objects.requireNonNull(
                 interruptIdSupplier,
                 "interruptIdSupplier cannot be null");
+        this.leaseSession = leaseSession;
     }
 
     @Override
@@ -59,7 +94,7 @@ public final class PersistentAgentCheckpointLifecycle
         execute(
                 "save committed step",
                 state,
-                () -> checkpointService.save(
+                () -> save(
                         state,
                         AgentTaskStatus.RUNNING,
                         null));
@@ -79,7 +114,7 @@ public final class PersistentAgentCheckpointLifecycle
         execute(
                 "save completed run",
                 state,
-                () -> checkpointService.save(
+                () -> save(
                         state,
                         status,
                         interrupt));
@@ -109,6 +144,25 @@ public final class PersistentAgentCheckpointLifecycle
                 clock.instant());
     }
 
+    private void save(
+            AgentState state,
+            AgentTaskStatus status,
+            PendingInterrupt interrupt
+    ) {
+        if (leaseSession == null) {
+            checkpointService.save(state, status, interrupt);
+            return;
+        }
+
+        leaseSession.requireActive();
+        checkpointService.save(
+                state,
+                status,
+                interrupt,
+                leaseSession.currentPermit()
+        );
+    }
+
     private void execute(
             String operation,
             AgentState state,
@@ -116,6 +170,8 @@ public final class PersistentAgentCheckpointLifecycle
     ) {
         try {
             action.run();
+        } catch (AgentExecutionLeaseLostException exception) {
+            throw exception;
         } catch (RuntimeException exception) {
             throw new AgentCheckpointLifecycleException(
                     "failed to " + operation

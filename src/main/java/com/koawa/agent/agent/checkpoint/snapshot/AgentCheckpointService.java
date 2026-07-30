@@ -1,5 +1,6 @@
 package com.koawa.agent.agent.checkpoint.snapshot;
 
+import com.koawa.agent.agent.checkpoint.lease.AgentExecutionPermit;
 import com.koawa.agent.agent.domain.AgentState;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.PendingInterrupt;
@@ -19,6 +20,7 @@ public final class AgentCheckpointService {
     private final AgentCheckpointStore store;
     private final AgentTaskSnapshotMapper mapper;
     private final Clock clock;
+    private final AgentFencedCheckpointWriter fencedWriter;
 
     public AgentCheckpointService(
             AgentCheckpointStore store,
@@ -32,9 +34,19 @@ public final class AgentCheckpointService {
             AgentTaskSnapshotMapper mapper,
             Clock clock
     ) {
+        this(store, mapper, clock, null);
+    }
+
+    public AgentCheckpointService(
+            AgentCheckpointStore store,
+            AgentTaskSnapshotMapper mapper,
+            Clock clock,
+            AgentFencedCheckpointWriter fencedWriter
+    ) {
         this.store = Objects.requireNonNull(store, "store cannot be null");
         this.mapper = Objects.requireNonNull(mapper, "mapper cannot be null");
         this.clock = Objects.requireNonNull(clock, "clock cannot be null");
+        this.fencedWriter = fencedWriter;
     }
 
     /**
@@ -70,22 +82,41 @@ public final class AgentCheckpointService {
             AgentTaskStatus status,
             PendingInterrupt pendingInterrupt
     ) {
-        Objects.requireNonNull(state, "state cannot be null");
-        AgentTaskSnapshot current = requireSnapshot(state.getTaskId());
-        if (current.revision() == Long.MAX_VALUE) {
-            throw new IllegalStateException(
-                    "checkpoint revision limit reached for task "
-                            + state.getTaskId());
-        }
-
-        AgentTaskSnapshot next = mapper.toSnapshot(
+        PendingSave pending = prepareSave(
                 state,
                 status,
-                current.revision() + 1,
-                pendingInterrupt,
-                current.createdAt(),
-                clock.instant());
-        return store.save(next, current.revision());
+                pendingInterrupt
+        );
+        return store.save(
+                pending.snapshot(),
+                pending.expectedRevision()
+        );
+    }
+
+    /**
+     * Saves through a writer that atomically verifies the execution permit.
+     */
+    public AgentTaskSnapshot save(
+            AgentState state,
+            AgentTaskStatus status,
+            PendingInterrupt pendingInterrupt,
+            AgentExecutionPermit permit
+    ) {
+        if (fencedWriter == null) {
+            throw new IllegalStateException(
+                    "fenced checkpoint writer is not configured"
+            );
+        }
+        PendingSave pending = prepareSave(
+                state,
+                status,
+                pendingInterrupt
+        );
+        return fencedWriter.save(
+                pending.snapshot(),
+                pending.expectedRevision(),
+                permit
+        );
     }
 
     /**
@@ -104,6 +135,31 @@ public final class AgentCheckpointService {
                         new CheckpointNotFoundException(taskId));
     }
 
+    private PendingSave prepareSave(
+            AgentState state,
+            AgentTaskStatus status,
+            PendingInterrupt pendingInterrupt
+    ) {
+        Objects.requireNonNull(state, "state cannot be null");
+        AgentTaskSnapshot current = requireSnapshot(state.getTaskId());
+        if (current.revision() == Long.MAX_VALUE) {
+            throw new IllegalStateException(
+                    "checkpoint revision limit reached for task "
+                            + state.getTaskId()
+            );
+        }
+
+        AgentTaskSnapshot next = mapper.toSnapshot(
+                state,
+                status,
+                current.revision() + 1,
+                pendingInterrupt,
+                current.createdAt(),
+                clock.instant()
+        );
+        return new PendingSave(next, current.revision());
+    }
+
     public record LoadedAgentCheckpoint(
             AgentTaskSnapshot snapshot,
             AgentState state
@@ -113,5 +169,11 @@ public final class AgentCheckpointService {
             Objects.requireNonNull(snapshot, "snapshot cannot be null");
             Objects.requireNonNull(state, "state cannot be null");
         }
+    }
+
+    private record PendingSave(
+            AgentTaskSnapshot snapshot,
+            long expectedRevision
+    ) {
     }
 }

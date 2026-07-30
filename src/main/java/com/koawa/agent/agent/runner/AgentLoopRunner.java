@@ -3,6 +3,7 @@ package com.koawa.agent.agent.runner;
 import com.koawa.agent.agent.domain.*;
 import com.koawa.agent.agent.event.AgentEventSink;
 import com.koawa.agent.agent.exception.AgentCheckpointLifecycleException;
+import com.koawa.agent.agent.exception.AgentExecutionLeaseLostException;
 import com.koawa.agent.agent.exception.AgentFailureException;
 import com.koawa.agent.agent.executor.AgentActionExecutor;
 import com.koawa.agent.agent.planner.AgentPlanner;
@@ -247,7 +248,9 @@ public class AgentLoopRunner {
 
             return state;
         } catch (RuntimeException exception) {
-            if (exception instanceof AgentCheckpointLifecycleException) {
+            if (exception instanceof AgentCheckpointLifecycleException
+                    || exception
+                    instanceof AgentExecutionLeaseLostException) {
                 throw exception;
             }
             if (completeIfStopped(state)) {

@@ -22,9 +22,18 @@ public final class AgentExecutionLeaseLostException
             long fencingToken,
             Reason reason
     ) {
+        this(taskId, fencingToken, reason, null);
+    }
+
+    public AgentExecutionLeaseLostException(
+            String taskId,
+            long fencingToken,
+            Reason reason,
+            Throwable cause
+    ) {
         super("execution lease lost for task " + taskId
                 + " with fencing token " + fencingToken
-                + ": " + reason);
+                + ": " + reason, cause);
         this.taskId = taskId;
         this.fencingToken = fencingToken;
         this.reason = Objects.requireNonNull(
@@ -48,6 +57,7 @@ public final class AgentExecutionLeaseLostException
     public enum Reason {
         LEASE_MISSING,
         OWNER_OR_TOKEN_MISMATCH,
-        LEASE_EXPIRED
+        LEASE_EXPIRED,
+        RENEWAL_FAILED
     }
 }

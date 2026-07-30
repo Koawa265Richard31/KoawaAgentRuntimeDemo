@@ -1,6 +1,7 @@
 package com.koawa.agent.agent.checkpoint.lease;
 
 import com.koawa.agent.agent.checkpoint.snapshot.AgentCheckpointStore;
+import com.koawa.agent.agent.checkpoint.snapshot.JdbcAgentFencedCheckpointWriter;
 import com.koawa.agent.agent.checkpoint.snapshot.AgentTaskSnapshotJsonCodec;
 import com.koawa.agent.agent.checkpoint.snapshot.JdbcAgentCheckpointStore;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot;
@@ -58,6 +59,7 @@ class PostgresJdbcAgentExecutionLeaseStoreTest {
     private JdbcTemplate jdbcTemplate;
     private JdbcAgentCheckpointStore checkpointStore;
     private JdbcAgentExecutionLeaseStore leaseStore;
+    private JdbcAgentFencedCheckpointWriter fencedWriter;
     private AtomicInteger ownerSequence;
 
     @BeforeEach
@@ -88,6 +90,10 @@ class PostgresJdbcAgentExecutionLeaseStoreTest {
         leaseStore = new JdbcAgentExecutionLeaseStore(
                 jdbcTemplate,
                 () -> "owner-" + ownerSequence.incrementAndGet()
+        );
+        fencedWriter = new JdbcAgentFencedCheckpointWriter(
+                jdbcTemplate,
+                new AgentTaskSnapshotJsonCodec()
         );
     }
 
@@ -270,6 +276,67 @@ class PostgresJdbcAgentExecutionLeaseStoreTest {
         assertTrue(leaseStore.load("task-1").isEmpty());
     }
 
+    @Test
+    void shouldWriteCheckpointWithCurrentPermit() {
+        saveCheckpoint("task-1");
+        AgentExecutionPermit permit = leaseStore.acquire(
+                "task-1",
+                0,
+                LEASE_DURATION
+        );
+
+        fencedWriter.save(
+                checkpoint("task-1", 1, CREATED_AT.plusSeconds(1)),
+                0,
+                permit
+        );
+
+        assertEquals(
+                1,
+                checkpointStore.load("task-1")
+                        .orElseThrow()
+                        .revision()
+        );
+    }
+
+    @Test
+    void shouldFenceOldPermitBeforeReportingRevisionConflict() {
+        saveCheckpoint("task-1");
+        AgentExecutionPermit first = leaseStore.acquire(
+                "task-1",
+                0,
+                LEASE_DURATION
+        );
+        expireLease("task-1");
+        AgentExecutionPermit second = leaseStore.acquire(
+                "task-1",
+                0,
+                LEASE_DURATION
+        );
+        AgentTaskSnapshot next = checkpoint(
+                "task-1",
+                1,
+                CREATED_AT.plusSeconds(1)
+        );
+        fencedWriter.save(next, 0, second);
+
+        AgentExecutionLeaseLostException failure = assertThrows(
+                AgentExecutionLeaseLostException.class,
+                () -> fencedWriter.save(next, 0, first)
+        );
+
+        assertEquals(
+                Reason.OWNER_OR_TOKEN_MISMATCH,
+                failure.getReason()
+        );
+        assertEquals(
+                1,
+                checkpointStore.load("task-1")
+                        .orElseThrow()
+                        .revision()
+        );
+    }
+
     private Callable<Boolean> acquire(
             JdbcAgentExecutionLeaseStore store,
             CountDownLatch ready,
@@ -302,25 +369,33 @@ class PostgresJdbcAgentExecutionLeaseStoreTest {
 
     private void saveCheckpoint(String taskId) {
         checkpointStore.save(
-                new AgentTaskSnapshot(
-                        AgentTaskSnapshot.CURRENT_SCHEMA_VERSION,
-                        taskId,
-                        "conversation-1",
-                        "user-1",
-                        0,
-                        AgentTaskStatus.RUNNING,
-                        "question",
-                        0,
-                        4,
-                        CREATED_AT.plusSeconds(300),
-                        List.of(),
-                        List.of(),
-                        Map.of(),
-                        null,
-                        CREATED_AT,
-                        CREATED_AT
-                ),
+                checkpoint(taskId, 0, CREATED_AT),
                 AgentCheckpointStore.NO_REVISION
+        );
+    }
+
+    private AgentTaskSnapshot checkpoint(
+            String taskId,
+            long revision,
+            Instant updatedAt
+    ) {
+        return new AgentTaskSnapshot(
+                AgentTaskSnapshot.CURRENT_SCHEMA_VERSION,
+                taskId,
+                "conversation-1",
+                "user-1",
+                revision,
+                AgentTaskStatus.RUNNING,
+                "question",
+                0,
+                4,
+                CREATED_AT.plusSeconds(300),
+                List.of(),
+                List.of(),
+                Map.of(),
+                null,
+                CREATED_AT,
+                updatedAt
         );
     }
 

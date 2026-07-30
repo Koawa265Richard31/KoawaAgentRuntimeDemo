@@ -2042,3 +2042,166 @@ A 的 Lease 过期后 B 可能已经以更大的 Token 接管。如果 A 的迟�
 
 下一步是 `M0-S4d`：增加 Permit-aware Checkpoint Write、Lease Session/Heartbeat 和
 Lease Lost 停止边界。M0-S4c 到此停止，不提前连接 Resume 入口。
+
+## 2026-07-30：M0-S4d Fenced Write 与 Lease Heartbeat
+
+### 本切片目标
+
+本切片完成 Lease 取得之后的两道保护：
+
+```text
+后台 Heartbeat
+  → 维持当前 Permit
+  → 续租失败记录 Lease Lost
+
+Checkpoint Boundary
+  → revision CAS
+  → ownerId + fencingToken + 数据库过期时间
+  → 任一不满足则拒绝写入
+```
+
+本切片不组合 Resume Claim，不增加 REST API，也不修改 Snapshot JSON 或数据库结构。
+
+### Permit-aware Checkpoint Write
+
+新增 `AgentFencedCheckpointWriter`，与普通 `AgentCheckpointStore` 分开。普通 Store 继续支持
+首次任务和既有非 Resume 路径；恢复执行必须显式传入 `AgentExecutionPermit`。
+
+JDBC 实现的核心条件位于同一条 `UPDATE`：
+
+```sql
+WHERE current_checkpoint.task_id = ?
+  AND current_checkpoint.revision = ?
+  AND EXISTS (
+      SELECT 1
+      FROM agent_execution_lease AS lease
+      WHERE lease.task_id = current_checkpoint.task_id
+        AND lease.owner_id = ?
+        AND lease.fencing_token = ?
+        AND lease.lease_expires_at > statement_timestamp()
+      FOR UPDATE
+  )
+```
+
+因此不存在“先在 Java 中检查 Lease，随后 Lease 被接管，但旧 Worker 仍完成 Checkpoint
+UPDATE”的窗口。`FOR UPDATE` 会锁住匹配的 Lease 行，使旧写入与新 Token 接管按数据库
+锁顺序串行化；只有 `EXISTS` 条件而不锁行仍会留下交错窗口。
+
+失败诊断有明确优先级：如果 revision 和 Token 同时过期，优先返回
+`AgentExecutionLeaseLostException`。旧 Worker 不能把执行权丢失当成普通 CAS 冲突后自动
+重试。只有 Permit 仍有效时，revision 不匹配才是 `CheckpointConflictException`。
+
+内存实现用于确定性组件测试。它明确记录：Lease Store 检查和 Checkpoint Store CAS 不是
+跨 Map 原子操作，不能用来证明分布式 Fencing；数据库保证只来自 JDBC 单语句实现。
+
+### Lease Session 与 Heartbeat
+
+`AgentExecutionLeaseSession` 持有最新 Permit，并用守护线程按配置间隔调用 `renew()`：
+
+```text
+start
+  → scheduleWithFixedDelay
+  → renew current Permit
+  → 保存数据库返回的新 expiresAt
+  → 失败后停止继续续租
+```
+
+`renewInterval` 必须小于 `leaseDuration`，两者最小精度为 1 毫秒。Session 不使用 Worker
+本地时间判断数据库 Lease 是否过期。
+
+任何非预期 Renew 异常都会转换成：
+
+```text
+AgentExecutionLeaseLostException
+reason = RENEWAL_FAILED
+```
+
+这样数据库短暂不可用时，Worker 不会假定自己仍然持有执行权。Session 在下一个
+Checkpoint 安全边界通过 `requireActive()` 抛出保存的失败。
+
+`close()` 会停止 Heartbeat，并尽力 Release 最新 Permit。Release 失败只记录
+`taskId + fencingToken`，不输出完整 ownerId，也不会覆盖已经形成的业务结果。
+
+### Runtime 停止边界
+
+`PersistentAgentCheckpointLifecycle` 新增 Lease Session 路径：
+
+```text
+stepCommitted/completed
+  → session.requireActive()
+  → session.currentPermit()
+  → AgentCheckpointService.save(..., permit)
+  → AgentFencedCheckpointWriter
+```
+
+普通新任务路径保持原行为，不要求 Permit。`AgentLoopRunner` 对
+`AgentExecutionLeaseLostException` 直接向上抛出，不转换成普通 `ERROR`，也不会尝试写入一个
+虚假的 FAILED Checkpoint。
+
+### 已执行确认
+
+- M0-S4d 非 PostgreSQL 定向测试：14 tests，0 failures，0 errors，0 skipped。
+- 全量回归：149 tests，0 failures，0 errors，13 skipped。
+- 新增覆盖：
+  - 当前 Permit + 当前 revision 可以写入。
+  - 当前 Permit 下保留普通 revision conflict。
+  - 过期 Permit 不推进 revision。
+  - Token 和 revision 同时过期时优先 Lease Lost。
+  - Heartbeat 更新 Session 中的最新 expiresAt。
+  - Renew 基础设施失败转换为 `RENEWAL_FAILED`。
+  - Session Close 释放最新 Permit。
+  - Agent Loop 不吞掉 Lease Lost。
+
+### 尚未验证
+
+- `PostgresJdbcAgentExecutionLeaseStoreTest` 已增加 2 个 Fenced Write 场景，但当前 Docker
+  不可用，因此该类 7 个测试全部 skipped。
+- 全量 13 个 skipped 均为 PostgreSQL/Testcontainers 测试。
+- 因此 JDBC 条件 UPDATE 的真实 PostgreSQL 语义仍属于尚未在本轮环境执行确认的边界。
+
+### 面试问题
+
+#### 问题一：为什么 Fencing 校验必须和 Checkpoint Update 是同一条 SQL？
+
+参考回答：
+
+如果先查询 Lease 再更新 Checkpoint，Lease 可以在两个语句之间过期并被接管。旧 Worker
+虽然通过了第一次检查，仍可能在新 Worker 之后写入。把 Lease 条件放进 UPDATE，数据库只在
+该语句执行时仍满足 Token 和有效期的情况下修改 Checkpoint。
+
+#### 问题二：为什么同时过期时优先报告 Lease Lost，而不是 revision conflict？
+
+参考回答：
+
+revision conflict 对合法执行者可能是可重载、可重试的并发错误；Lease Lost 表示调用者已经
+没有执行资格，必须停止。若旧 Worker 收到普通 CAS 冲突后重新加载并重试，就可能绕过
+Fencing 的安全意图。
+
+#### 问题三：Heartbeat 失败为什么不能继续“乐观执行”？
+
+参考回答：
+
+Worker 无法确认数据库中的 Lease 是否仍属于自己。继续调用模型或工具可能与新持有者并行
+产生成本和副作用。因此先记录 Lease Lost，并在下一个安全边界停止；最终 Checkpoint 写仍由
+数据库 Fencing 兜底。
+
+#### 问题四：为什么 Release 失败不能覆盖原业务结果？
+
+参考回答：
+
+Release 是缩短 Lease 恢复时间的清理动作，不是正确性的唯一来源。即使 Release 失败，
+Lease 仍会自然过期。若 close 异常覆盖已经完成的业务结果，调用者反而无法区分任务失败和
+清理失败。
+
+#### 问题五：为什么内存 Fenced Writer 不能证明分布式安全？
+
+参考回答：
+
+它先从 Lease Map 读取再写 Checkpoint Map，两者不是一个数据库原子操作。它适合验证异常
+分类和调用链，但只有 PostgreSQL 中包含 Lease EXISTS 条件的单条 UPDATE 才能证明真实
+Fencing 窗口被关闭。
+
+### 下一切片
+
+下一步是 `M0-S4e`：组合 Resume Evaluate/Interrupt Consume、Acquire、Snapshot Restore、
+Lease Session 和 Fenced Lifecycle，验证两个并发 Resume 只有一个进入执行阶段。

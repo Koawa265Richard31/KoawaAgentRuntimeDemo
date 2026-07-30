@@ -6,6 +6,8 @@ import com.koawa.agent.agent.domain.AgentObservation;
 import com.koawa.agent.agent.domain.AgentState;
 import com.koawa.agent.agent.event.AgentEventSink;
 import com.koawa.agent.agent.exception.AgentCheckpointLifecycleException;
+import com.koawa.agent.agent.exception.AgentExecutionLeaseLostException;
+import com.koawa.agent.agent.exception.AgentExecutionLeaseLostException.Reason;
 import com.koawa.agent.agent.recovery.AgentRecoveryDecision;
 import org.junit.jupiter.api.Test;
 
@@ -64,6 +66,28 @@ class AgentLoopCheckpointLifecycleTest {
         assertThrows(
                 AgentCheckpointLifecycleException.class,
                 () -> runner(lifecycle).run(state));
+        assertNull(state.getStopReason());
+    }
+
+    @Test
+    void shouldPropagateLeaseLostWithoutConvertingItToAgentError() {
+        AgentCheckpointLifecycle lifecycle =
+                new AgentCheckpointLifecycle() {
+                    @Override
+                    public void stepCommitted(AgentState state) {
+                        throw new AgentExecutionLeaseLostException(
+                                state.getTaskId(),
+                                7,
+                                Reason.OWNER_OR_TOKEN_MISMATCH
+                        );
+                    }
+                };
+        AgentState state = state();
+
+        assertThrows(
+                AgentExecutionLeaseLostException.class,
+                () -> runner(lifecycle).run(state)
+        );
         assertNull(state.getStopReason());
     }
 
