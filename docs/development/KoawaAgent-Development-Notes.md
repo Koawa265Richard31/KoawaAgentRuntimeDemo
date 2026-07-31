@@ -2809,3 +2809,223 @@ Store 合同已经定义 latest-first，并由内存/JDBC 实现保证。Query S
 `AgentResumeCommand`，调用 `AgentResumeExecutionService`，再使用本切片的 Query Service
 读取权威任务状态，明确映射 `Executed/Rejected/Recovered`，但不在同一切片扩展 PostgreSQL
 E2E 或 Conversation Store。
+
+## 2026-08-01：M0-S5c Resume HTTP API
+
+### 本切片目标
+
+M0-S5a 已经完成 Resume 运行编排，M0-S5b 提供了查询最新 revision 和 Interrupt 的只读
+控制面。本切片把两者连接成同步 HTTP 命令：
+
+```http
+POST /api/agent/v1/tasks/{taskId}/resume
+Content-Type: application/json
+
+{
+  "expectedRevision": 7,
+  "interruptId": "interrupt-7",
+  "userInput": "module-a"
+}
+```
+
+`interruptId` 和 `userInput` 在恢复 RUNNING 任务时可以为空；恢复 `WAITING_FOR_INPUT` 时由既有
+Resume/Consumption 领域服务实施上下文相关校验。
+
+本切片只固定成功执行、业务拒绝和恢复修复三类结果合同。Checkpoint 不存在、revision 冲突、
+Lease 冲突和 Lease 丢失等异常的统一错误体留给 M0-S5d。
+
+### HTTP 调用链
+
+```text
+POST Resume
+  → Bean Validation(expectedRevision)
+  → ResumeRequest 映射为 AgentResumeCommand
+  → AgentResumeExecutionService.resume(command)
+      ├─ Executed
+      ├─ Rejected
+      └─ Recovered
+  → AgentTaskQueryService.findByTaskId(taskId)
+  → 读取持久化后的权威 Task View
+  → 映射 HTTP 状态与公共响应
+```
+
+HTTP Controller 不接触 Lease、Permit、Heartbeat、Fencing Token、Snapshot Mapper 或 Runner。
+这些执行细节继续封装在 M0-S4/M0-S5a 的应用服务中。
+
+### 为什么执行后重新查询 Task
+
+`AgentRunResult` 描述本次运行结果，但不包含 Checkpoint revision 和完整持久化状态。如果
+Controller 根据运行前的 command revision 推算响应，会遇到：
+
+```text
+WAITING revision 7
+  → Consume User Input：revision 8
+  → Step Commit：revision 9
+  → Completed：revision 10
+```
+
+revision 增长次数取决于实际路径，不能写成固定 `expectedRevision + 1`。因此无论结果是
+Executed、Rejected 还是 Recovered，Controller 都通过 Query Service 再读一次最新 Snapshot，
+返回真正持久化的 `AgentTaskView`。
+
+### 三类公共响应
+
+新增 `AgentResumeResponse` sealed interface。它与内部的
+`AgentResumeExecutionResult` 分离，避免把恢复对象、运行时 State 或内部决策结构直接序列化。
+HTTP 层还定义独立的 `RejectionReason` 与 `RecoveryOutcome` 枚举并显式映射。这样领域枚举
+未来增加内部状态时，不会自动扩大公共 JSON 合同。
+
+#### Executed
+
+```text
+HTTP 200 OK
+outcome = EXECUTED
+task = 持久化后的 AgentTaskView
+runResult = 本次 Agent Loop 的结果
+```
+
+示例：
+
+```json
+{
+  "outcome": "EXECUTED",
+  "task": {
+    "taskId": "task-1",
+    "revision": 10,
+    "status": "COMPLETED"
+  },
+  "runResult": {
+    "stopReason": "FINAL_ANSWER",
+    "content": "Completed module-a"
+  }
+}
+```
+
+#### Rejected
+
+```text
+HTTP 409 Conflict
+outcome = REJECTED
+task = 当前权威 AgentTaskView
+rejectionReason = 固定业务拒绝原因
+```
+
+它表示请求与当前任务状态冲突，例如 Interrupt ID 不匹配或任务已经终态。公共
+`RejectionReason` 根本不定义 `NONE`，避免出现名为 Rejected、实际却没有拒绝原因的矛盾
+结果。
+
+#### Recovered
+
+```text
+HTTP 200 OK
+outcome = RECOVERED
+task = 修复后的权威 AgentTaskView
+recoveryOutcome = TERMINAL_STEP_REPAIRED 等
+```
+
+Recovered 不是失败：请求没有再次调用模型或工具，但 Runtime 完成了必要的 terminal boundary
+修复，所以返回 200。响应 record 禁止 `READY_TO_CONTINUE`，因为可继续的恢复必须进入
+Agent Loop 并最终成为 Executed。
+
+### 为什么响应不是一个带大量 nullable 字段的 record
+
+候选的单 DTO 可能是：
+
+```text
+outcome
+task
+runResult?
+rejectionReason?
+recoveryOutcome?
+```
+
+它允许 `EXECUTED + rejectionReason` 或 `REJECTED + runResult` 等非法组合。三个 record 让 JSON
+结构和 Java 类型同时表达互斥分支：
+
+```text
+Executed  只携带 task + runResult
+Rejected  只携带 task + rejectionReason
+Recovered 只携带 task + recoveryOutcome
+```
+
+每个 record 的紧凑构造器继续校验 outcome 与分支匹配。
+
+### 请求校验
+
+HTTP 请求使用：
+
+```java
+@NotNull @PositiveOrZero Long expectedRevision
+```
+
+这里刻意使用 `Long` 而不是 `long`。如果使用 primitive，JSON 缺少字段时 Jackson 会产生 0，
+服务端无法区分“客户端明确提交 revision 0”和“客户端根本没有提交 revision”。使用 boxed
+类型可让缺失字段保持 null，并由 Bean Validation 返回 400。
+
+### 已执行确认
+
+- 定向 `AgentResumeControllerTest`：5 tests，0 failures，0 errors，0 skipped。
+- 相关 Resume/Task Query/Spring Context：41 tests，0 failures，0 errors，0 skipped。
+- 全量回归：174 tests，0 failures，0 errors，14 skipped。
+- MockMvc 已确认 Executed=200、Rejected=409、Recovered=200。
+- 缺少或提交负数 expectedRevision 均返回 400，且不会调用运行服务或查询服务。
+- 三种 JSON 只包含各自合法字段；矛盾的公共响应 record 会在构造时被拒绝。
+
+### 尚未验证与限制
+
+- 全量 14 个 skipped 仍为既有 PostgreSQL/Testcontainers 用例；当前 Docker 环境不可用。
+- 本切片的 Controller 测试 Mock 了应用服务，证明 HTTP 映射合同，但不能替代真实 PostgreSQL
+  Resume E2E。
+- `CheckpointNotFoundException`、`CheckpointConflictException`、
+  `AgentExecutionConflictException`、`AgentExecutionLeaseLostException` 等尚未映射为稳定公共错误
+  DTO；目前依赖 Spring 默认异常处理，不视为 API 闭环。
+- 端点是同步调用：HTTP 连接会保持到 Agent Loop 停止。长任务是否转为异步提交/轮询属于后续
+  Runtime API 研究，不在 M0 中臆测实现。
+- 项目仍没有认证上下文，Resume 尚未实施任务所有权校验，不能直接作为多租户生产 API。
+
+### 面试问题
+
+#### 问题一：为什么 Resume 返回前还要重新查询 Task？
+
+参考回答：
+
+一次 Resume 可能先消费 Interrupt，再保存多个 Step，最后保存终态，revision 不一定只增加 1。
+AgentRunResult 也不携带持久化 revision。重新查询可以返回数据库中的权威状态，避免 Controller
+复制 revision 推进规则。
+
+#### 问题二：为什么 Recovered 返回 200，而不是 409？
+
+参考回答：
+
+Recovered 表示请求成功触发了幂等恢复修复，例如把 terminal Step 已保存但仍 RUNNING 的任务
+修为 COMPLETED。它没有重新运行模型，但达成了合法目标，因此是成功结果，不是状态冲突。
+
+#### 问题三：为什么 Rejected 返回 409？
+
+参考回答：
+
+请求 JSON 本身可以解析，但与当前资源状态不兼容，例如 interruptId 不是当前边界或任务已经
+终态。这更接近资源状态冲突，而不是 400 语法错误。客户端应先 GET 最新 Task，再决定是否
+重试或停止。
+
+#### 问题四：为什么 expectedRevision 用 Long 而不是 long？
+
+参考回答：
+
+primitive long 在字段缺失时会得到默认 0，无法区分缺失和合法 revision 0。Long 保留 null，
+配合 `@NotNull` 可以让缺失字段稳定返回 400，同时 `@PositiveOrZero` 拒绝负数。
+
+#### 问题五：为什么不直接返回 AgentResumeExecutionResult？
+
+参考回答：
+
+ExecutionResult 是应用层内部协议，其中 Recovered 持有 Snapshot Recovery 对象，Rejected
+持有领域决策，未来都可能因内部实现演进。独立 HTTP Response 只复制稳定字段，防止内部类型
+变化无意破坏外部 JSON 合同。
+
+### 下一切片
+
+建议进入 `M0-S5d`：建立统一 `AgentApiError` 与 `@RestControllerAdvice`，锁定 not found、
+validation、stale revision、active lease、interrupt consumption、lease lost 和 checkpoint
+lifecycle failure 的 HTTP 状态、可重试提示及敏感字段边界。本切片不同时开始 PostgreSQL
+重启 E2E。
