@@ -5,9 +5,11 @@ import com.koawa.agent.agent.checkpoint.lease.AgentExecutionLeaseStore;
 import com.koawa.agent.agent.checkpoint.lease.JdbcAgentExecutionLeaseStore;
 import com.koawa.agent.agent.checkpoint.resume.AgentInterruptConsumptionService;
 import com.koawa.agent.agent.checkpoint.resume.AgentResumeClaimService;
+import com.koawa.agent.agent.checkpoint.resume.AgentResumeExecutionService;
 import com.koawa.agent.agent.checkpoint.resume.AgentResumeService;
 import com.koawa.agent.agent.checkpoint.resume.AgentSnapshotRecoveryService;
 import com.koawa.agent.agent.checkpoint.snapshot.*;
+import com.koawa.agent.agent.runner.AgentLoopRunner;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
@@ -131,6 +133,17 @@ public class AgentCheckpointConfiguration {
                 clock,
                 properties.getLeaseDuration(),
                 properties.getRenewInterval()
+        );
+    }
+
+    @Bean
+    public AgentResumeExecutionService agentResumeExecutionService(
+            AgentResumeClaimService claimService,
+            AgentLoopRunner runner
+    ) {
+        return new AgentResumeExecutionService(
+                claimService,
+                runner
         );
     }
 }

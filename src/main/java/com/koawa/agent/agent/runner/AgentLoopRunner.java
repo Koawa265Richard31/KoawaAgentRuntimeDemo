@@ -105,7 +105,25 @@ public class AgentLoopRunner {
     }
 
     public AgentState run(AgentState state) {
-        Objects.requireNonNull(state);
+        return run(state, checkpointLifecycle);
+    }
+
+    /**
+     * Runs one state with a lifecycle owned by this execution attempt.
+     *
+     * <p>The overload keeps the singleton runner reusable while ensuring a
+     * resumed task cannot fall back to the runner's default lifecycle.
+     */
+    public AgentState run(
+            AgentState state,
+            AgentCheckpointLifecycle executionLifecycle
+    ) {
+        Objects.requireNonNull(state, "state cannot be null");
+        AgentCheckpointLifecycle actualLifecycle =
+                Objects.requireNonNull(
+                        executionLifecycle,
+                        "executionLifecycle cannot be null"
+                );
 
         if (state.getCurrentStep() < 0) {
             throw new IllegalArgumentException(
@@ -213,7 +231,7 @@ public class AgentLoopRunner {
 
                 state.getSteps().add(step);
                 state.setCurrentStep(stepIndex + 1);
-                checkpointLifecycle.stepCommitted(state);
+                actualLifecycle.stepCommitted(state);
 
                 if (completeIfStopped(state)) {
                     return state;

@@ -2462,3 +2462,170 @@ Worker 接管前后提交修复；Fencing 才能证明写入者仍持有当前�
 M0-S4 到此完成。下一阶段是 `M0-S5`：Task 查询、Resume REST API、错误映射、真实
 PostgreSQL 重启恢复 E2E 和会话历史持久化。该范围明显大于单切片文件上限，开始前应先按
 API 合同、运行编排、PostgreSQL E2E、Conversation Store 拆分为可独立验收的子切片。
+
+## 2026-07-31：M0-S5a Resume 运行编排
+
+### 本切片目标
+
+上一切片的 `AgentResumeClaimService` 已经能完成：
+
+```text
+Evaluate
+  → Consume（仅 WAITING_FOR_INPUT）
+  → Acquire Lease
+  → Recovery
+  → 返回 AgentClaimedExecution
+```
+
+但 `Claimed` 只代表“已取得执行资格”，还没有真正进入 `AgentLoopRunner`。本切片补齐
+Claim 后的运行编排，使恢复状态、Fenced Checkpoint Lifecycle 和 Lease 清理在一次执行中
+保持同一所有权边界。
+
+本切片不实现 REST Controller、Task Query、Conversation Store 或新的数据库表，避免把
+API 合同、运行语义和持久化扩展混入同一次提交。
+
+### 核心调用链
+
+新增 `AgentResumeExecutionService`，调用顺序固定为：
+
+```text
+resume(command)
+  → claimService.claim(command)
+      ├─ Rejected  → 返回 Rejected，不进入 Agent Loop
+      ├─ Recovered → 返回 Recovered，不进入 Agent Loop
+      └─ Claimed
+          → try (AgentClaimedExecution)
+          → requireActive()
+          → runner.run(state, fencedLifecycle)
+          → fencedLifecycle.completed(terminalState)
+          → 返回 Executed(AgentRunResult)
+          → close：停止 Heartbeat，并尽力 Release Lease
+```
+
+`try-with-resources` 同时覆盖正常返回和异常路径。Planner、Action Executor、
+`stepCommitted` 或 `completed` 任一处抛出异常时，执行上下文仍会关闭，避免 Heartbeat
+继续续租或 Lease 一直占用。
+
+### 为什么 Runner 要支持每次执行传入 Lifecycle
+
+`AgentLoopRunner` 是 Spring 单例，其构造器中的默认 Lifecycle 服务于普通 Chat 路径。
+Resume 的 Lifecycle 则携带本次 Lease Session 的 ownerId 与 fencingToken，只能属于本次
+Claim。
+
+因此新增重载：
+
+```java
+run(AgentState state, AgentCheckpointLifecycle executionLifecycle)
+```
+
+原有 `run(state)` 仍委托给构造时的默认 Lifecycle，不改变 Chat 行为。Resume 必须显式传入
+`execution.checkpointLifecycle()`，从而防止恢复任务错误地使用普通 CAS 写入，或复用另一
+次执行的 Fencing 身份。
+
+### 为什么 Runner 返回后还要调用 completed
+
+`AgentLoopRunner` 在每个 Step 提交后调用 `stepCommitted`，但它只负责循环，不负责判断
+上层要用哪种持久化所有权完成终态边界。普通 Chat 由 `DefaultAgentChatService` 调用
+`completed`；Resume 则必须由持有 Fenced Lifecycle 的运行编排服务调用。
+
+所以一次最终回答会有两次有意义的写入：
+
+```text
+初始 snapshot: revision 1，已有 Step 0，RUNNING
+
+执行 Step 1 / FINAL_ANSWER
+  → stepCommitted
+  → revision 2，Step 1 已保存
+
+退出 Agent Loop
+  → completed
+  → revision 3，任务状态 COMPLETED
+```
+
+这两次写入不是重复保存。revision 2 证明 Step 结果已经持久化；revision 3 证明整个任务的
+终态边界已经持久化。二者都使用同一个 Lease Session 的 Fenced Lifecycle。
+
+### 运行结果为什么分三类
+
+新增的 `AgentResumeExecutionResult` 是封闭结果类型：
+
+- `Executed`：取得 Claim 并实际运行 Agent Loop，返回 `AgentRunResult`。
+- `Rejected`：状态矩阵或 revision 前置条件拒绝，请求没有进入执行阶段。
+- `Recovered`：恢复阶段已修复 terminal boundary，请求完成了必要写入，但不应再次运行
+  Agent Loop。
+
+这样 Controller 后续可以穷尽映射三类结果，而不需要从 `null`、异常或布尔值猜测“到底有
+没有运行”。
+
+### Spring 组装
+
+`AgentCheckpointConfiguration` 新增 `AgentResumeExecutionService` Bean，复用已有的
+`AgentResumeClaimService` 与 `AgentLoopRunner`。本轮没有创建第二个 Runner，也没有把
+Lease/Fencing 细节暴露到 Controller 层。
+
+### 已执行确认
+
+- 定向测试：`AgentResumeExecutionServiceTest` 与
+  `AgentLoopCheckpointLifecycleTest`，8 tests，0 failures，0 errors，0 skipped。
+- 相关 Resume/Recovery/Lease/Fenced Lifecycle 回归：49 tests，0 failures，
+  0 errors，0 skipped。
+- 全量回归：161 tests，0 failures，0 errors，14 skipped。
+- Spring Context 成功创建新的 `AgentResumeExecutionService` Bean。
+- 异常测试确认 Runner 失败时 Lease 会被 Release，且异常继续向上传播。
+- Rejected/Recovered 测试确认两类结果都不会调用 Agent Loop。
+
+### 尚未验证
+
+- 全量 14 个 skipped 均为 PostgreSQL/Testcontainers 用例；当前 Testcontainers 未发现
+  可用 Docker 环境。
+- 本切片没有新增 SQL 或 PostgreSQL 专属语义，运行编排使用内存 Store 完成行为验证；但
+  不能把本轮结果表述为真实 PostgreSQL Resume E2E 已验证。
+- 尚未接入 HTTP API，因此还没有验证状态码、并发冲突错误体和序列化合同。
+
+### 面试问题
+
+#### 问题一：为什么 Resume 不能直接调用 `runner.run(state)`？
+
+参考回答：
+
+`runner.run(state)` 使用 Runner 构造时的默认 Lifecycle，而 Resume 的写入资格属于本次
+Claim，包含 ownerId 和 fencingToken。若不显式传入本次执行的 Fenced Lifecycle，旧 Worker
+可能绕过 Lease 校验用普通 CAS 写回，Fencing 就只停留在 Acquire 阶段，没有覆盖执行结果。
+
+#### 问题二：为什么 `completed` 不直接放进 AgentLoopRunner？
+
+参考回答：
+
+Runner 负责 Step 循环和停止条件，Lifecycle 的所有权由调用场景决定。普通 Chat 和 Resume
+的完成写入分别由不同上层服务负责，后者还绑定 Lease Session。把 `completed` 强塞进
+Runner 会混淆循环职责，也难以表达初始化失败、恢复修复和不进入循环的结果。
+
+#### 问题三：为什么 `AgentClaimedExecution` 要用 try-with-resources？
+
+参考回答：
+
+它持有的不只是状态，还代表活跃 Heartbeat 和 Lease 所有权。正常返回、Planner 失败、工具
+失败或终态保存失败都必须停止续租并 Release。try-with-resources 把所有退出路径统一到
+`close()`，比在多个 catch/return 分支手工清理更可靠。
+
+#### 问题四：为什么 Recovered 不能继续进入 Agent Loop？
+
+参考回答：
+
+Recovered 表示 Snapshot 的最后一个 Step 已经是 terminal，只是任务状态还没同步到终态。
+恢复服务已经用 Fenced Write 修复这个边界。若再次进入循环，会在一个已经完成的业务结果后
+继续规划，可能重复调用模型或工具。
+
+#### 问题五：为什么一个最终 Step 会产生两次 revision？
+
+参考回答：
+
+第一次写保存 Step 本身，解决“动作结果是否落库”；第二次写保存任务终态，解决“任务是否
+完成”。崩溃可能发生在两次写之间，所以恢复逻辑必须能识别“terminal Step 已保存但状态仍
+RUNNING”。把两次写拆开使这个故障窗口可观察、可修复，并让每次状态推进都有独立 CAS。
+
+### 下一切片
+
+建议进入 `M0-S5b`：先定义 Task Query 与 Resume HTTP API 的 DTO、状态码和错误映射，再用
+Controller 测试锁定合同。运行编排已经具备，API 层不需要再直接操作 Lease、Permit 或
+Fencing Token。

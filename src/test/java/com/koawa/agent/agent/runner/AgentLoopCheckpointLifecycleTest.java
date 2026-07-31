@@ -91,6 +91,34 @@ class AgentLoopCheckpointLifecycleTest {
         assertNull(state.getStopReason());
     }
 
+    @Test
+    void shouldUseLifecycleSuppliedForThisRun() {
+        AtomicInteger defaultCalls = new AtomicInteger();
+        AtomicInteger executionCalls = new AtomicInteger();
+        AgentCheckpointLifecycle defaultLifecycle =
+                new AgentCheckpointLifecycle() {
+                    @Override
+                    public void stepCommitted(AgentState state) {
+                        defaultCalls.incrementAndGet();
+                    }
+                };
+        AgentCheckpointLifecycle executionLifecycle =
+                new AgentCheckpointLifecycle() {
+                    @Override
+                    public void stepCommitted(AgentState state) {
+                        executionCalls.incrementAndGet();
+                    }
+                };
+
+        runner(defaultLifecycle).run(
+                state(),
+                executionLifecycle
+        );
+
+        assertEquals(0, defaultCalls.get());
+        assertEquals(1, executionCalls.get());
+    }
+
     private AgentLoopRunner runner(
             AgentCheckpointLifecycle checkpointLifecycle
     ) {
