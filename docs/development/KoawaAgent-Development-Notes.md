@@ -2629,3 +2629,183 @@ RUNNING”。把两次写拆开使这个故障窗口可观察、可修复，并�
 建议进入 `M0-S5b`：先定义 Task Query 与 Resume HTTP API 的 DTO、状态码和错误映射，再用
 Controller 测试锁定合同。运行编排已经具备，API 层不需要再直接操作 Lease、Permit 或
 Fencing Token。
+
+## 2026-08-01：M0-S5b Task Query HTTP API
+
+### 本切片目标
+
+Resume Command 要求调用者提交 `taskId + expectedRevision`，等待用户输入时还必须提交当前
+`interruptId`。在没有 Task Query 的情况下，客户端刷新、Runtime 重启或并发写入后无法取得
+权威 revision，也无法知道当前正在等待哪个 Interrupt。
+
+因此本切片先建立只读控制面：
+
+```text
+GET Task
+  → 取得最新 revision/status/pendingInterrupt
+  → 下一切片 POST Resume
+```
+
+本切片不调用 `AgentResumeExecutionService`，不定义 Resume 请求体，不增加全局异常映射，
+也不修改数据库表。
+
+### HTTP 合同
+
+新增两个端点：
+
+```http
+GET /api/agent/v1/tasks/{taskId}
+GET /api/agent/v1/conversations/{conversationId}/tasks
+```
+
+单任务存在时返回 `200 OK + AgentTaskView`，不存在时返回 `404 Not Found`。会话查询直接保持
+`AgentCheckpointStore.list()` 的 `updatedAt DESC, taskId` 顺序；当前 M0 合同返回完整数组。
+
+示例控制面响应：
+
+```json
+{
+  "taskId": "task-1",
+  "conversationId": "conversation-1",
+  "revision": 7,
+  "status": "WAITING_FOR_INPUT",
+  "nextStep": 2,
+  "maxSteps": 8,
+  "deadlineAt": "2026-08-01T01:10:00Z",
+  "pendingInterrupt": {
+    "interruptId": "interrupt-7",
+    "type": "USER_INPUT",
+    "prompt": "Please provide a module name",
+    "createdAt": "2026-08-01T01:01:00Z"
+  },
+  "createdAt": "2026-08-01T01:00:00Z",
+  "updatedAt": "2026-08-01T01:02:00Z"
+}
+```
+
+### 为什么不直接返回 AgentTaskSnapshot
+
+`AgentTaskSnapshot` 是恢复协议，不是公共 API DTO，其中包含：
+
+```text
+userId
+originalQuestion
+steps[].thought
+steps[].actionArgumentsJson
+steps[].observationMetadataJson
+historySnapshot
+recoveryContext
+pendingInterrupt.context
+schemaVersion
+```
+
+这些字段可能包含用户内容、模型内部文本、工具参数或仅供恢复使用的元数据。直接序列化会把
+Snapshot schema 与 HTTP schema 锁死，并可能因未来增加恢复字段而意外扩大 API 暴露面。
+
+`AgentTaskView` 因此采用字段白名单，只暴露客户端驱动任务生命周期所需的数据。HTTP 合同
+测试显式断言上述内部字段不存在，而不是依赖开发者记得添加 Jackson ignore 注解。
+
+### AgentTaskView 不变量
+
+公共 View 不只是任意 JSON 容器，它继续保持关键状态不变量：
+
+```text
+revision >= 0
+0 <= nextStep <= maxSteps
+maxSteps > 0
+WAITING 状态必须存在 pendingInterrupt
+非 WAITING 状态不得存在 pendingInterrupt
+WAITING_FOR_INPUT 只能对应 USER_INPUT
+WAITING_FOR_APPROVAL 只能对应 APPROVAL
+updatedAt >= createdAt
+```
+
+`PendingInterruptView` 只保留 `interruptId/type/prompt/createdAt`，不复制内部 `context`。
+
+### 查询服务与 Controller 的职责
+
+```text
+AgentTaskController
+  → 只处理路径和 HTTP 200/404
+
+AgentTaskQueryService
+  → 校验并规范化查询 ID
+  → 调用 AgentCheckpointStore.load/list
+  → Snapshot 映射为 AgentTaskView
+
+AgentCheckpointStore
+  → 继续负责读取最新持久化 Snapshot
+```
+
+Controller 不直接依赖 JDBC Store，也不在 API 层挑选 Snapshot 字段。这样下一切片 Resume
+结束后可以再次调用 Query Service，返回数据库中的权威 revision/status，而不是从运行时对象
+猜测最终持久化版本。
+
+### 已执行确认
+
+- 定向测试：`AgentTaskQueryServiceTest` 与 `AgentTaskControllerTest`，8 tests，
+  0 failures，0 errors，0 skipped。
+- 相关 Task/Snapshot/Store/Spring Context 回归：32 tests，0 failures，0 errors，
+  0 skipped。
+- 全量回归：169 tests，0 failures，0 errors，14 skipped。
+- Spring Context 成功创建 `AgentTaskQueryService` 和 `AgentTaskController`。
+- MockMvc 已确认单任务 200、缺失任务 404、会话列表顺序和 JSON 字段白名单。
+
+### 尚未验证与限制
+
+- 全量 14 个 skipped 均为既有 PostgreSQL/Testcontainers 用例；当前 Docker 环境仍不可用。
+- 本切片只复用已有 Store 查询，不增加 SQL、事务、CAS 或并发语义，因此没有新增
+  PostgreSQL 专属结论。
+- 会话任务列表目前没有分页；任务量增长后的分页协议和索引性能尚未设计。
+- 当前项目没有认证上下文，端点尚未实施 taskId/conversationId 所有权校验。字段白名单降低
+  暴露面，但不能替代认证授权；在接入真实多用户环境前必须补齐。
+- 当前 Task View 是控制面视图，不返回完整 Step、对话历史或最终答案详情。
+
+### 面试问题
+
+#### 问题一：为什么 Resume API 之前先实现 Task Query？
+
+参考回答：
+
+Resume 使用 expectedRevision 做乐观并发控制，等待输入时还要校验 interruptId。客户端必须先
+读取最新任务状态，才能构造有意义的 Resume Command。否则刷新或重启后只能猜 revision，
+冲突也无法恢复成“重新读取再提交”的正常流程。
+
+#### 问题二：为什么不能直接把 AgentTaskSnapshot 作为 HTTP Response？
+
+参考回答：
+
+Snapshot 是内部恢复协议，包含 history、recoveryContext、thought 和工具参数。把它直接暴露
+会泄漏内部数据，并把持久化 schema 与公共 API 绑定。独立 View 使用字段白名单，让两种协议
+能够分别演进。
+
+#### 问题三：字段白名单比 `@JsonIgnore` 好在哪里？
+
+参考回答：
+
+`@JsonIgnore` 是黑名单：Snapshot 新增字段时默认可能被序列化，开发者必须记得继续排除。
+独立 View 是白名单：只有明确复制的字段才会进入 API，新恢复字段默认不可见，泄漏风险和
+协议耦合更低。
+
+#### 问题四：列表为什么不在 Query Service 里重新排序？
+
+参考回答：
+
+Store 合同已经定义 latest-first，并由内存/JDBC 实现保证。Query Service 只做一对一映射并
+保持顺序，避免同一排序语义在数据库和 Java 中重复实现。未来分页时，排序必须继续下推到
+数据库，才能保证跨页稳定。
+
+#### 问题五：返回 404 是否意味着任务一定从未存在？
+
+参考回答：
+
+不一定。当前 404 只表示最新 Checkpoint Store 中没有这个 taskId，可能是从未创建，也可能
+是管理员执行了 retention delete。API 不应凭空区分 Store 无法证明的原因；若未来需要审计
+删除语义，应增加 tombstone 或独立审计记录。
+
+### 下一切片
+
+建议进入 `M0-S5c`：实现 `POST /api/agent/v1/tasks/{taskId}/resume`。请求体映射为
+`AgentResumeCommand`，调用 `AgentResumeExecutionService`，再使用本切片的 Query Service
+读取权威任务状态，明确映射 `Executed/Rejected/Recovered`，但不在同一切片扩展 PostgreSQL
+E2E 或 Conversation Store。

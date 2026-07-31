@@ -3,6 +3,7 @@ package com.koawa.agent.agent.checkpoint;
 import com.koawa.agent.agent.checkpoint.lease.AgentExecutionLeaseProperties;
 import com.koawa.agent.agent.checkpoint.lease.AgentExecutionLeaseStore;
 import com.koawa.agent.agent.checkpoint.lease.JdbcAgentExecutionLeaseStore;
+import com.koawa.agent.agent.checkpoint.query.AgentTaskQueryService;
 import com.koawa.agent.agent.checkpoint.resume.AgentInterruptConsumptionService;
 import com.koawa.agent.agent.checkpoint.resume.AgentResumeClaimService;
 import com.koawa.agent.agent.checkpoint.resume.AgentResumeExecutionService;
@@ -145,5 +146,12 @@ public class AgentCheckpointConfiguration {
                 claimService,
                 runner
         );
+    }
+
+    @Bean
+    public AgentTaskQueryService agentTaskQueryService(
+            AgentCheckpointStore store
+    ) {
+        return new AgentTaskQueryService(store);
     }
 }
