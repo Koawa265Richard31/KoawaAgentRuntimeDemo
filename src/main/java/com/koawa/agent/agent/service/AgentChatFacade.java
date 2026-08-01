@@ -3,10 +3,10 @@ package com.koawa.agent.agent.service;
 import com.koawa.agent.agent.domain.AgentRunResult;
 import com.koawa.agent.agent.domain.AgentStopReason;
 import com.koawa.agent.agent.runtime.AgentTaskCancellationRegistry;
-import com.koawa.agent.agent.runtime.InMemoryAgentConversationStore;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import java.util.Objects;
 import java.util.concurrent.TimeUnit;
 
 @Slf4j
@@ -14,17 +14,26 @@ import java.util.concurrent.TimeUnit;
 public final class AgentChatFacade {
 
     private final AgentChatService agentChatService;
-    private final InMemoryAgentConversationStore conversationStore;
+    private final AgentConversationStore conversationStore;
     private final AgentTaskCancellationRegistry cancellationRegistry;
 
     public AgentChatFacade(
             AgentChatService agentChatService,
-            InMemoryAgentConversationStore conversationStore,
+            AgentConversationStore conversationStore,
             AgentTaskCancellationRegistry cancellationRegistry
     ) {
-        this.agentChatService = agentChatService;
-        this.conversationStore = conversationStore;
-        this.cancellationRegistry = cancellationRegistry;
+        this.agentChatService = Objects.requireNonNull(
+                agentChatService,
+                "agentChatService cannot be null"
+        );
+        this.conversationStore = Objects.requireNonNull(
+                conversationStore,
+                "conversationStore cannot be null"
+        );
+        this.cancellationRegistry = Objects.requireNonNull(
+                cancellationRegistry,
+                "cancellationRegistry cannot be null"
+        );
     }
 
     public AgentRunResult chat(

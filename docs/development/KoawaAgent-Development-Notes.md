@@ -3188,3 +3188,226 @@ Lease Lost 往往发生在执行已经开始之后。旧 Worker 可能已经调�
 M0 主线尚余真实 PostgreSQL 重启 E2E 和 Conversation Store 持久化。Docker 恢复后应优先完成
 PostgreSQL Resume/重启闭环；若继续暂时绕开环境阻塞，下一切片可先收敛 Conversation Store 的
 领域端口与持久化边界，但 PostgreSQL 行为在 Testcontainers 通过前只能标记为尚未验证。
+
+## 2026-08-01：M0-S5e Conversation Store 领域端口
+
+### 本切片目标
+
+M0-S5d 完成 HTTP 错误边界后，M0 还缺少跨任务会话历史持久化。当前代码虽然存在只读端口
+`AgentConversationHistoryLoader`，但写入端没有接口：
+
+```text
+DefaultAgentChatService
+  → AgentConversationHistoryLoader（抽象读取）
+
+AgentChatFacade
+  → InMemoryAgentConversationStore（具体写入）
+```
+
+因此直接增加 JDBC 实现仍无法替换 Facade 的具体依赖。本切片先新增读写端口
+`AgentConversationStore`，并锁定当前内存实现的基本不变量。它是下一步持久化替换点，但本切片
+不新增数据库表，也不宣称重启后历史已经可恢复。
+
+### 新的读写边界
+
+```java
+public interface AgentConversationStore
+        extends AgentConversationHistoryLoader {
+
+    void appendTurn(
+            String conversationId,
+            String userId,
+            String question,
+            String answer
+    );
+}
+```
+
+继承只读 Loader 的原因不是让所有消费者都依赖更大的接口。`DefaultAgentChatService` 仍只依赖
+`AgentConversationHistoryLoader`，因为它只需要在创建任务前加载上下文；只有负责提交可交付
+回复的 `AgentChatFacade` 依赖 `AgentConversationStore`。这保持了接口隔离：
+
+```text
+DefaultAgentChatService ──只读──→ AgentConversationHistoryLoader
+                                      ↑
+AgentChatFacade ──────────读写──→ AgentConversationStore
+                                      ↑
+                         InMemoryAgentConversationStore
+```
+
+Spring 中一个 `InMemoryAgentConversationStore` Bean 同时满足两个注入点。后续 JDBC 实现接入时，
+Facade 不再需要知道数据来自内存还是 PostgreSQL。
+
+### Turn 为什么必须成对追加
+
+当前会话上下文按以下顺序保存：
+
+```text
+USER(question)
+ASSISTANT(answer)
+```
+
+`appendTurn` 把二者视为一个逻辑单元。内存实现使用：
+
+```java
+conversations.compute(key, (ignored, existing) -> append(...));
+```
+
+对于同一个 key，`ConcurrentHashMap.compute` 会以一次映射更新发布新的不可变 List。并发读取者
+只能看到旧 List 或包含完整 user/assistant 对的新 List，不会看到只追加 question 的半个 Turn。
+这只是单进程内存原子性；未来 JDBC 必须用单行 Turn 或事务获得相同边界。
+
+### 为什么改用 ConversationKey
+
+旧实现用字符串拼接作为 Map key：
+
+```java
+normalize(userId) + ":" + normalize(conversationId)
+```
+
+它存在真实碰撞：
+
+```text
+userId="a:b", conversationId="c"   → "a:b:c"
+userId="a",   conversationId="b:c" → "a:b:c"
+```
+
+两个不同会话会错误共享历史。新实现改为：
+
+```java
+private record ConversationKey(
+        String conversationId,
+        String userId
+) {
+}
+```
+
+record 的 `equals/hashCode` 分别比较两个字段，不依赖分隔符编码，所以不会出现上述歧义。数据库
+切片也应保留独立的 `conversation_id`、`user_id` 列，而不是持久化拼接 key。
+
+### 为什么 List.copyOf 仍然不够
+
+`ChatMessage` 是带 setter 的可变类。下面只能保护 List 结构：
+
+```java
+List.copyOf(messages)
+```
+
+调用者虽然不能 `add/remove`，仍可以执行：
+
+```java
+loaded.get(0).setContent("changed");
+```
+
+如果 Store 返回内部元素引用，历史就会被外部修改。因此 `load()` 现在逐条创建新的
+`ChatMessage(role, content)`，再对新 List 使用 `List.copyOf`：
+
+```text
+内部不可变 List + 内部 ChatMessage
+              ↓ 逐元素复制
+外部不可变 List + 外部 ChatMessage 副本
+```
+
+调用者可以修改自己的消息副本，但再次 load 仍得到原始内容。这里的“防御性复制”同时保护了
+容器和可变元素边界。
+
+### 20 条窗口为什么仍按完整 Turn 裁剪
+
+内存基线继续保留最近 20 条消息，也就是最多 10 个完整 user/assistant Turn。每次只追加两条，
+再从尾部截取最多 20 条，因此不会留下只有 answer 或只有 question 的半组消息。顺序保持
+oldest-first，能直接交给现有上下文组装器。
+
+本切片没有把 `20` 提升为长期公共协议。M6 Context Engine 最终应按 token/字符预算选择历史，
+而不是永久依赖固定消息数量；当前窗口只是保持 M0 既有行为。
+
+### 为什么没有立即按 taskId 去重
+
+持久化 Store 最终需要幂等写入，但仅使用 `taskId` 作为唯一键会过早锁错语义：一个任务可以
+多次 `ASK_CLARIFICATION`，用户回复后还可能产生最终答案，同一个 taskId 下可能存在多个逻辑
+对话 Turn。如果现在规定“一个 taskId 只能写一次”，后续澄清消息会被误判为重复。
+
+JDBC 设计必须先确定稳定 Turn identity，例如 `taskId + turn/step/revision boundary`，并同时决定：
+
+- Checkpoint 已完成、Conversation 尚未追加时如何修复；
+- 数据库提交成功但调用方收到失败时如何去重；
+- 同一 Conversation 的并发 Task 按请求时间还是提交时间排序；
+- Resume 产生的用户输入和最终回复由谁追加。
+
+这些会改变 schema 和恢复语义，按治理规则必须在下一持久化切片先形成 ADR，不能在本端口切片
+中臆测一个唯一键。
+
+### 已执行确认
+
+- 最窄测试：8 tests，0 failures，0 errors，0 skipped。
+- 相关 Store/Facade/History Loader/Checkpoint Lifecycle/Spring Context：13 tests，
+  0 failures，0 errors，0 skipped。
+- 全量回归：196 tests，0 failures，0 errors，14 skipped。
+- Spring Context 已确认同一个内存 Store 可以同时注入只读 Loader 和读写 Store。
+- 测试已确认两个分隔符碰撞 key 相互隔离。
+- 测试已确认只保留最近 10 个完整 Turn，并保持 oldest-first。
+- 测试已确认修改 load 返回的 `ChatMessage` 不会污染后续读取。
+- 测试已确认只有 `FINAL_ANSWER`/`ASK_CLARIFICATION` 的非空内容进入 Store。
+
+### 尚未验证与限制
+
+- 当前运行时仍装配 `InMemoryAgentConversationStore`；进程退出后历史仍然丢失。
+- 没有新增 Flyway migration、JDBC 实现或 PostgreSQL 测试，本切片不涉及数据库行为结论。
+- 全量 14 个 skipped 仍为既有 PostgreSQL/Testcontainers 用例；Docker daemon 当前未运行。
+- Checkpoint 完成与 `appendTurn` 是两个独立动作，中间崩溃可能出现任务已完成但跨任务历史缺失。
+- 当前 Resume HTTP 路径没有把恢复后的最终回复写入 Conversation Store。
+- 内存 `compute` 只解决单 JVM 同 key 更新；不能证明多实例顺序或数据库事务语义。
+
+### 面试问题
+
+#### 问题一：为什么已经有 HistoryLoader，还要增加 ConversationStore？
+
+参考回答：
+
+HistoryLoader 是只读端口，适合只需要组装上下文的 AgentChatService；Facade 还需要追加 Turn，
+此前只能依赖 InMemory 具体类。新增 Store 让写入也经过抽象边界，同时保留读消费者的最小接口，
+后续才能在不修改业务调用方的情况下替换 JDBC 实现。
+
+#### 问题二：为什么 AgentConversationStore 继承 Loader，而不是把 load 再写一遍？
+
+参考回答：
+
+Store 是 Loader 能力的超集，同一个实现需要同时支持读写。继承复用读取合同，但消费者仍按所需
+能力依赖：只读服务声明 Loader，写入 Facade 声明 Store，避免所有组件都获得不需要的写能力。
+
+#### 问题三：ConcurrentHashMap.compute 在这里保证了什么？
+
+参考回答：
+
+它保证同一个 ConversationKey 的 read-modify-write 映射更新是原子的，两个线程不会各自基于
+旧 List 覆盖对方；新 List 一次发布，所以不会暴露半个 Turn。它不保证跨 JVM、数据库事务或
+业务请求顺序，这些必须由持久化层单独解决。
+
+#### 问题四：为什么字符串拼接不能作为复合 key？
+
+参考回答：
+
+当字段本身允许包含分隔符时，不同字段组合可能编码成同一字符串，导致租户或会话数据串线。
+结构化 record 分别参与 equals/hashCode；数据库中也使用独立列和复合索引，避免不可靠编码。
+
+#### 问题五：List.copyOf 为什么不能完全保护会话历史？
+
+参考回答：
+
+它只做浅复制并禁止修改 List 结构，元素 ChatMessage 仍是可变对象。调用者可通过 setter 修改
+共享元素。因此 Store load 时需要逐元素复制；长期也可以把持久化边界映射到不可变 Message
+Snapshot。
+
+#### 问题六：为什么本切片不直接用 taskId 做幂等键？
+
+参考回答：
+
+一个任务可能跨越多次澄清和最终回答，taskId 不等于唯一对话 Turn。只按 taskId 去重会误吞
+合法后续消息。应先定义稳定 Turn boundary，再用 taskId 与 step/revision 等组成幂等身份，并用
+崩溃实验验证 Checkpoint 与 Conversation 两个写入之间的恢复策略。
+
+### 下一切片
+
+进入 `M0-S5f：Conversation Store 持久化设计`。由于它将改变 Flyway schema、幂等和崩溃恢复
+语义，先以 DESIGN 模式起草 ADR，比较“每条 Message 一行”“每个 Turn 一行”和“从 Checkpoint
+投影重建”至少三种方案，确定 Turn identity、排序、事务/修复和保留策略。ADR 批准后再拆 JDBC
+实现与 PostgreSQL/Testcontainers 验证；不与真实 Resume 重启 E2E 混在同一提交。

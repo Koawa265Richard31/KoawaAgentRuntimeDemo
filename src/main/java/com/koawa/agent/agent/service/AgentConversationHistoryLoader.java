@@ -27,6 +27,12 @@ public interface AgentConversationHistoryLoader {
     AgentConversationHistoryLoader EMPTY =
             (conversationId, userId) -> List.of();
 
+    /**
+     * Loads a detached, oldest-first snapshot of available messages.
+     *
+     * @return a non-null snapshot whose list or message mutations cannot
+     * affect the store
+     */
     List<ChatMessage> load(
             String conversationId,
             String userId
