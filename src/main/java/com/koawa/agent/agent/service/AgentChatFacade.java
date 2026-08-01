@@ -1,5 +1,7 @@
 package com.koawa.agent.agent.service;
 
+import com.koawa.agent.agent.domain.AgentConversationTurn;
+import com.koawa.agent.agent.domain.AgentConversationTurnInput;
 import com.koawa.agent.agent.domain.AgentRunResult;
 import com.koawa.agent.agent.domain.AgentStopReason;
 import com.koawa.agent.agent.runtime.AgentTaskCancellationRegistry;
@@ -50,12 +52,15 @@ public final class AgentChatFacade {
                 userId
         );
         if (isDeliverable(result)) {
-            conversationStore.appendTurn(
+            conversationStore.appendTurn(new AgentConversationTurn(
                     result.conversationId(),
                     userId,
-                    question,
+                    result.taskId(),
+                    terminalStepIndex(result),
+                    AgentConversationTurnInput.originalQuestion(question),
+                    outcome(result.stopReason()),
                     result.content()
-            );
+            ));
         }
         cancellationRegistry.clear(result.taskId());
         log.info(
@@ -80,5 +85,28 @@ public final class AgentChatFacade {
                 || result.stopReason() == AgentStopReason.ASK_CLARIFICATION)
                 && result.content() != null
                 && !result.content().isBlank();
+    }
+
+    private int terminalStepIndex(AgentRunResult result) {
+        if (result.stepCount() <= 0) {
+            throw new IllegalStateException(
+                    "deliverable run must contain a terminal step"
+            );
+        }
+        return result.stepCount() - 1;
+    }
+
+    private AgentConversationTurn.Outcome outcome(
+            AgentStopReason stopReason
+    ) {
+        return switch (stopReason) {
+            case FINAL_ANSWER ->
+                    AgentConversationTurn.Outcome.FINAL_ANSWER;
+            case ASK_CLARIFICATION ->
+                    AgentConversationTurn.Outcome.ASK_CLARIFICATION;
+            default -> throw new IllegalArgumentException(
+                    "stop reason is not deliverable: " + stopReason
+            );
+        };
     }
 }

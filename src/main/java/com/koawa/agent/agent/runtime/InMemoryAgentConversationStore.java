@@ -1,102 +1,118 @@
 package com.koawa.agent.agent.runtime;
 
+import com.koawa.agent.agent.domain.AgentConversationTurn;
+import com.koawa.agent.agent.exception.AgentConversationTurnConflictException;
 import com.koawa.agent.agent.service.AgentConversationStore;
 import com.koawa.agent.framework.convention.ChatMessage;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
 
 @Component
 public final class InMemoryAgentConversationStore
         implements AgentConversationStore {
 
-    private static final int MAX_MESSAGES = 20;
+    private static final int MAX_TURNS = 10;
 
-    private final ConcurrentMap<ConversationKey, List<ChatMessage>>
-            conversations = new ConcurrentHashMap<>();
-
-    @Override
-    public List<ChatMessage> load(String conversationId, String userId) {
-        List<ChatMessage> messages = conversations.get(
-                key(conversationId, userId)
-        );
-        return messages == null ? List.of() : detachedCopy(messages);
-    }
+    private final Map<ConversationKey, List<AgentConversationTurn>>
+            conversations = new HashMap<>();
+    private final Map<TurnIdentity, AgentConversationTurn>
+            turnsByIdentity = new HashMap<>();
 
     @Override
-    public void appendTurn(
+    public synchronized List<ChatMessage> load(
             String conversationId,
-            String userId,
-            String question,
-            String answer
+            String userId
     ) {
-        requireText(question, "question");
-        requireText(answer, "answer");
-        conversations.compute(
-                key(conversationId, userId),
-                (ignored, existing) -> append(
-                        existing,
-                        question,
-                        answer
+        List<AgentConversationTurn> turns = conversations.get(
+                new ConversationKey(
+                        requireText(conversationId, "conversationId"),
+                        normalizeUserId(userId)
                 )
         );
-    }
-
-    private List<ChatMessage> append(
-            List<ChatMessage> existing,
-            String question,
-            String answer
-    ) {
-        List<ChatMessage> updated = existing == null
-                ? new ArrayList<>()
-                : new ArrayList<>(existing);
-        updated.add(ChatMessage.user(question));
-        updated.add(ChatMessage.assistant(answer));
-        int fromIndex = Math.max(0, updated.size() - MAX_MESSAGES);
-        return List.copyOf(updated.subList(fromIndex, updated.size()));
-    }
-
-    private List<ChatMessage> detachedCopy(List<ChatMessage> messages) {
-        List<ChatMessage> copy = new ArrayList<>(messages.size());
-        for (ChatMessage message : messages) {
-            ChatMessage actualMessage = Objects.requireNonNull(
-                    message,
-                    "stored message cannot be null"
-            );
-            copy.add(new ChatMessage(
-                    actualMessage.getRole(),
-                    actualMessage.getContent()
-            ));
+        if (turns == null) {
+            return List.of();
         }
-        return List.copyOf(copy);
-    }
 
-    private ConversationKey key(String conversationId, String userId) {
-        return new ConversationKey(
-                normalize(conversationId),
-                normalize(userId)
+        int fromIndex = Math.max(0, turns.size() - MAX_TURNS);
+        List<ChatMessage> messages = new ArrayList<>(
+                (turns.size() - fromIndex) * 2
         );
+        for (int index = fromIndex; index < turns.size(); index++) {
+            AgentConversationTurn turn = turns.get(index);
+            messages.add(ChatMessage.user(turn.input().content()));
+            messages.add(ChatMessage.assistant(turn.outputContent()));
+        }
+        return List.copyOf(messages);
     }
 
-    private String normalize(String value) {
-        return value == null || value.isBlank() ? "anonymous" : value.trim();
+    @Override
+    public synchronized void appendTurn(AgentConversationTurn turn) {
+        AgentConversationTurn actualTurn = Objects.requireNonNull(
+                turn,
+                "turn cannot be null"
+        );
+        TurnIdentity identity = new TurnIdentity(
+                actualTurn.taskId(),
+                actualTurn.terminalStepIndex()
+        );
+        AgentConversationTurn existing = turnsByIdentity.get(identity);
+        if (existing != null) {
+            requireMatching(existing, actualTurn);
+            return;
+        }
+
+        ConversationKey key = new ConversationKey(
+                actualTurn.conversationId(),
+                actualTurn.userId()
+        );
+        conversations.computeIfAbsent(
+                key,
+                ignored -> new ArrayList<>()
+        ).add(actualTurn);
+        turnsByIdentity.put(identity, actualTurn);
     }
 
-    private void requireText(String value, String fieldName) {
+    private void requireMatching(
+            AgentConversationTurn existing,
+            AgentConversationTurn attempted
+    ) {
+        if (!existing.equals(attempted)) {
+            throw new AgentConversationTurnConflictException(
+                    attempted.taskId(),
+                    attempted.terminalStepIndex()
+            );
+        }
+    }
+
+    private String normalizeUserId(String userId) {
+        return userId == null || userId.isBlank()
+                ? null
+                : userId.trim();
+    }
+
+    private String requireText(String value, String fieldName) {
         if (value == null || value.isBlank()) {
             throw new IllegalArgumentException(
                     fieldName + " cannot be blank"
             );
         }
+        return value.trim();
     }
 
     private record ConversationKey(
             String conversationId,
             String userId
+    ) {
+    }
+
+    private record TurnIdentity(
+            String taskId,
+            int terminalStepIndex
     ) {
     }
 }

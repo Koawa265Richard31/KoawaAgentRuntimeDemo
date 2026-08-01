@@ -1,5 +1,7 @@
 package com.koawa.agent.agent.service;
 
+import com.koawa.agent.agent.domain.AgentConversationTurn;
+import com.koawa.agent.agent.domain.AgentConversationTurnInput;
 import com.koawa.agent.agent.domain.AgentRunResult;
 import com.koawa.agent.agent.domain.AgentStopReason;
 import com.koawa.agent.agent.runtime.AgentTaskCancellationRegistry;
@@ -50,12 +52,17 @@ class AgentChatFacadeTest {
         );
 
         assertSame(result, actual);
-        verify(conversationStore).appendTurn(
+        verify(conversationStore).appendTurn(new AgentConversationTurn(
                 "actual-conversation",
                 "user-1",
-                "question",
+                "task-1",
+                1,
+                AgentConversationTurnInput.originalQuestion("question"),
+                stopReason == AgentStopReason.FINAL_ANSWER
+                        ? AgentConversationTurn.Outcome.FINAL_ANSWER
+                        : AgentConversationTurn.Outcome.ASK_CLARIFICATION,
                 "deliverable answer"
-        );
+        ));
         verify(cancellationRegistry).clear("task-1");
     }
 

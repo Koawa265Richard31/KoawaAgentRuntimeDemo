@@ -1,5 +1,7 @@
 package com.koawa.agent.agent.service;
 
+import com.koawa.agent.agent.domain.AgentConversationTurn;
+
 /**
  * Read/write boundary for cross-task conversation history.
  *
@@ -9,10 +11,5 @@ package com.koawa.agent.agent.service;
 public interface AgentConversationStore
         extends AgentConversationHistoryLoader {
 
-    void appendTurn(
-            String conversationId,
-            String userId,
-            String question,
-            String answer
-    );
+    void appendTurn(AgentConversationTurn turn);
 }

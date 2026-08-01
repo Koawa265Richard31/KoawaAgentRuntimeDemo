@@ -3898,3 +3898,214 @@ M1-S7，而不是掩盖缺口。
 
 当前仍等待项目负责人接受 ADR-004。接受后继续 `M0-S5g`，先按当前真实语义完成类型化 Turn、
 Flyway/JDBC Store 与 PostgreSQL 证据；M1-S7 作为后续强制适配 Gate，不提前混入 M0。
+
+## 2026-08-01：M0-S5g 类型化 Conversation Turn 与 PostgreSQL Store
+
+### 本切片结果
+
+项目负责人以“进行下一个切片”批准 ADR-004 进入实现，ADR 状态由 `Proposed` 改为 `Accepted`。
+本切片完成类型化 Turn/Input、Flyway V3、JDBC Store、内存兼容实现和真实 PostgreSQL 的幂等、
+事务与排序验证，但没有把 JDBC Store 切到主运行路径。生产文件严格控制为 8 个，没有进入
+M0-S5h 的 terminal committer、Resume 或 Recovery 接线。
+
+新增的领域命令是：
+
+```java
+public record AgentConversationTurn(
+        String conversationId,
+        String userId,
+        String taskId,
+        int terminalStepIndex,
+        AgentConversationTurnInput input,
+        Outcome outcome,
+        String outputContent
+) {
+}
+
+public record AgentConversationTurnInput(
+        Type type,
+        String content,
+        String sourceInterruptId
+) {
+}
+```
+
+字段分成三类：
+
+- `conversationId + userId` 决定跨 Task 历史属于哪个 Conversation scope；`null/blank userId`
+  统一成 SQL `NULL`，真实字符串 `"anonymous"` 是另一个用户，不能混在一起。
+- `taskId + terminalStepIndex` 是 Turn 的稳定幂等身份。一个 Task 可以先后产生多个 ASK 和最终
+  FINAL，所以不能只用 `taskId`；revision 是 Checkpoint 写版本，也不能代替业务身份。
+- `input + outcome + outputContent` 是不可变 payload。`ORIGINAL_QUESTION` 不允许带 interrupt ID，
+  `INTERRUPT_REPLY` 必须带来源 interrupt ID；输出只允许 `FINAL_ANSWER` 或
+  `ASK_CLARIFICATION`。
+
+ID 会 trim，用户和模型的消息内容只验证非空白、不 trim，避免悄悄改变 Prompt/回复。领域对象不
+包含 `conversationScopeId`、`turnSequence`、`committedAt`，因为它们是数据库分配的存储元数据，
+不是调用方提交的幂等 payload。
+
+### 数据库结构
+
+Flyway V3 新增：
+
+```text
+agent_conversation_head
+  conversation_scope_id PK
+  conversation_id + nullable user_id UNIQUE NULLS NOT DISTINCT
+  next_turn_sequence
+
+agent_conversation_turn
+  conversation_scope_id + turn_sequence PK
+  task_id + terminal_step_index UNIQUE
+  typed input / typed output / committed_at
+```
+
+Head 的职责不是保存消息，而是为一个 Conversation scope 提供行锁和下一个序号。Turn 表保存完整
+USER/ASSISTANT 对，因此读者永远不会看到“USER 已插入、ASSISTANT 尚未插入”的半个 Turn。
+
+PostgreSQL 普通 `UNIQUE(conversation_id, user_id)` 会把两个 `NULL` 当作互不相等，可能创建多个
+匿名 Head。V3 使用 `UNIQUE NULLS NOT DISTINCT`，让同一 conversation 下的两个 `NULL userId`
+发生唯一约束冲突，同时保留真实 `"anonymous"` 用户的独立 scope。
+
+Turn 不外键引用 Checkpoint。删除短期 Task Snapshot 不应删除长期 Conversation；删除 Head 才通过
+`ON DELETE CASCADE` 删除其 Turn。真实 PostgreSQL 用例已验证这两个方向。
+
+### appendTurn 的事务流转
+
+`JdbcAgentConversationStore` 接收 `JdbcTemplate + PlatformTransactionManager`，用
+`TransactionTemplate` 加入调用方事务或创建本地短事务：
+
+```text
+INSERT Head ... ON CONFLICT DO NOTHING
+  → SELECT Head ... FOR UPDATE
+  → 全局查询 (taskId, terminalStepIndex)
+      ├─ 相同 payload：幂等返回，不推进 sequence
+      ├─ 不同 payload：抛 AgentConversationTurnConflictException，事务回滚
+      └─ 不存在：Head.next_turn_sequence + 1 RETURNING
+                   → INSERT Turn
+```
+
+同一 scope 的并发 writer 会争用同一 Head 行锁，所以只有持锁者能分配序号；不能使用
+`SELECT max(turn_sequence) + 1`，因为两个事务可能同时读到同一个 max。
+
+不同 scope 仍可能并发争用同一个全局 Turn identity。INSERT 使用指定 identity 约束的
+`ON CONFLICT DO NOTHING`，影响行数为 0 时再读取赢家并逐字段比较。这里的 `DO NOTHING` 只是
+竞态探针，不是吞掉冲突：payload 不同仍抛类型化异常，刚创建的失败 Head 和已推进的 sequence
+随事务一起回滚。
+
+没有采用“捕获 `DuplicateKeyException` 后立即 SELECT”的原因是：PostgreSQL 唯一键错误会把当前
+事务置为 aborted。Store 加入外层 terminal 事务时，错误连接不能继续查询，还可能把外层事务标成
+rollback-only；`ON CONFLICT` 让事务保持可用，再由领域比较决定幂等还是冲突。
+
+### 最近十个 Turn 的读取
+
+数据库保留全部 Turn，`10` 只是 Prompt 读取窗口，不是删除策略：
+
+```sql
+SELECT input_content, output_content
+FROM (
+    SELECT turn_sequence, input_content, output_content
+    FROM ...
+    ORDER BY turn_sequence DESC
+    LIMIT 10
+) recent
+ORDER BY turn_sequence ASC;
+```
+
+内层先拿“最新 10 个”，外层再恢复为从旧到新的 Prompt 顺序。Java 每次把 Turn 展开成新的 USER、
+ASSISTANT `ChatMessage`，返回不可修改 List，调用方修改消息对象不会污染 Store。
+
+### 当前过渡边界
+
+`AgentConversationStore` 已从四个字符串升级为 `appendTurn(AgentConversationTurn)`；
+`AgentChatFacade` 在首次 Chat 上用 `stepCount - 1` 适配当前连续 Step 编号。这个推导只属于 M0-S5g
+过渡层，Resume 和 terminal recovery 必须在 M0-S5h 直接取得真实 terminal Step 与当前输入，不能
+复制该推导。
+
+主运行路径仍使用 `InMemoryAgentConversationStore`，而且 Facade 仍在 terminal Checkpoint 完成后
+事后 append。这意味着“Checkpoint 已提交、Turn 尚未写入”的崩溃窗口仍然存在。现在直接把 Bean
+换成 JDBC 只会把不安全双写搬进数据库，并不会得到原子性；M0-S5h 必须先建立统一 terminal
+committer，再同时接入首次 Chat、Resume 和 terminal repair。
+
+### 已执行确认
+
+- `mvn -q "-Dtest=AgentConversationTurnTest,InMemoryAgentConversationStoreTest,AgentChatFacadeTest" test`
+  通过。
+- Docker Desktop 4.81.0 / Engine 29.6.1 已启动；本机 docker-java 需要显式
+  `-Dapi.version=1.44`，否则 Testcontainers 会因为默认 API 低于 Engine 最低版本而跳过。
+- `PostgresJdbcAgentConversationStoreTest` 在 `postgres:16-alpine`（PostgreSQL 16.14）真实执行
+  11 个用例，0 failure、0 error、0 skipped。
+- PostgreSQL 用例通过 Flyway 先迁移到 V2，再实际执行 V3；没有用 `ScriptUtils` 冒充迁移验证。
+- 已验证相同重放不推进 Head、不同 payload 回滚、外层事务回滚、nullable scope、最近 10 Turn、
+  ASK/Resume/FINAL、多线程 50 Turn 得到连续 `1..50`、并发相同重放合并、跨 scope identity 竞态、
+  Checkpoint/Conversation 独立保留。
+- 全量回归使用同一 Docker/API 配置执行：212 tests、0 failure、0 error、0 skipped；所有
+  PostgreSQL/Testcontainers 用例均实际运行，未用 skip 代替通过。
+
+### 尚未验证与限制
+
+- JDBC Store 尚未注册为运行时 Bean，生产请求仍使用内存历史。
+- Checkpoint 终态与 Conversation Turn 尚未在同一事务提交；Fenced Write 与 Turn 的共同事务也
+  尚未验证。
+- Resume、terminal-step recovery 尚未生成类型化 Turn。
+- 尚未执行“进程退出后重新启动、创建下一 Task 并加载旧 Turn”的 PostgreSQL E2E；属于 M0-S5i。
+- M1 canonical ModelTurn/ModelContextItem/RunItem 与 typed streaming 仍未实现，继续受 M3-S1 Gate
+  约束。
+
+### 面试问题
+
+#### 问题一：为什么 Turn identity 用 taskId + terminalStepIndex，而不是 revision？
+
+参考回答：
+
+revision 是 Snapshot 的 CAS 写版本，每次状态保存都会变化；同一个 terminal Step 在修复或重放时
+可能对应不同 revision。一个 Task 又可能产生 ASK、Resume 后再次 ASK、最后 FINAL 多个可交付
+Turn。`taskId + terminalStepIndex` 直接标识哪一个 terminal Step 产生了这个 Turn，既支持一 Task
+多 Turn，也能让同一 Step 的恢复写幂等。
+
+#### 问题二：为什么需要 Conversation Head，不能直接 max(sequence) + 1？
+
+参考回答：
+
+`max + 1` 是先读后写，两个并发事务可能同时得到相同值。Head 把下一个序号变成一行可锁定状态；
+`SELECT ... FOR UPDATE` 让同一 scope 的 writer 串行分配，而不同 scope 仍可并行。唯一约束负责最后
+防线，事务回滚保证失败 writer 不留下 Turn 或推进后的 Head。
+
+#### 问题三：ON CONFLICT DO NOTHING 会不会把数据冲突静默吞掉？
+
+参考回答：
+
+不会。代码检查 INSERT 影响行数；0 表示并发赢家已经占用 identity，随后按全局 identity 读出赢家
+并比较完整不可变 payload。完全相同才是幂等，任何字段不同都抛类型化冲突并回滚。它避免的是
+PostgreSQL 23505 把事务打成 aborted，不是省略冲突处理。
+
+#### 问题四：为什么数据库要使用 UNIQUE NULLS NOT DISTINCT？
+
+参考回答：
+
+SQL 唯一约束通常允许多行 NULL，因为 NULL 与 NULL 不判等。但匿名用户统一存为 NULL，同一
+conversation 只能有一个匿名 Head；否则排序锁会分裂成多个 scope。PostgreSQL 的
+`NULLS NOT DISTINCT` 正好表达这个业务语义，同时不会把真实字符串 `"anonymous"` 与 NULL 混淆。
+
+#### 问题五：为什么用了真实 PostgreSQL 后还保留内存测试和 H2 测试？
+
+参考回答：
+
+领域/内存测试反馈快，适合验证不变量、防御性复制和端口行为；H2 适合 Spring 组件启动回归。
+但 nullable unique、`FOR UPDATE`、事务错误状态和并发顺序是 PostgreSQL 方言与事务语义，只有
+Testcontainers 的 PostgreSQL 才能形成该结论的 E3 证据。三类测试分工不同，不能互相冒充。
+
+#### 问题六：为什么本切片不直接把 JDBC Store 注入 AgentChatFacade？
+
+参考回答：
+
+当前 Facade 在 Checkpoint terminal 状态提交后才写 Conversation。换成 JDBC 仍是两个提交，进程
+可在中间崩溃。正确接入点是统一 terminal committer：在同一事务内做 revision/fencing 校验、写
+terminal Checkpoint、幂等追加 Turn。先证明 Store 自身，再在下一切片接事务，可以把故障边界和
+测试责任拆清楚。
+
+### 下一步
+
+进入 `M0-S5h：统一 terminal committer 与运行路径接入`。它将把 terminal Checkpoint 与 Turn 放入
+同一 PostgreSQL 事务，并统一首次 Chat、Resume、terminal repair；需要故障注入证明任一步失败时
+两者一起回滚。本切片不会提前进入 M1 协议 v2。
