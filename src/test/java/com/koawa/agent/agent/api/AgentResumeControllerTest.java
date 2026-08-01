@@ -12,6 +12,7 @@ import com.koawa.agent.agent.domain.AgentRunResult;
 import com.koawa.agent.agent.domain.AgentStopReason;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.InterruptType;
 import com.koawa.agent.agent.domain.AgentTaskStatus;
+import com.koawa.agent.agent.exception.AgentExecutionLeaseLostException;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.http.MediaType;
@@ -46,7 +47,9 @@ class AgentResumeControllerTest {
         mockMvc = standaloneSetup(new AgentResumeController(
                 executionService,
                 queryService
-        )).build();
+        ))
+                .setControllerAdvice(new AgentApiExceptionHandler())
+                .build();
     }
 
     @Test
@@ -181,13 +184,74 @@ class AgentResumeControllerTest {
         mockMvc.perform(post("/api/agent/v1/tasks/task-1/resume")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{}"))
-                .andExpect(status().isBadRequest());
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code")
+                        .value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.violations[0].field")
+                        .value("expectedRevision"));
         mockMvc.perform(post("/api/agent/v1/tasks/task-1/resume")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"expectedRevision\":-1}"))
-                .andExpect(status().isBadRequest());
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code")
+                        .value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.violations[0].field")
+                        .value("expectedRevision"));
 
         verifyNoInteractions(executionService, queryService);
+    }
+
+    @Test
+    void shouldReturnMalformedRequestWithoutInternalParserDetails()
+            throws Exception {
+        mockMvc.perform(post("/api/agent/v1/tasks/task-1/resume")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.code")
+                        .value("MALFORMED_REQUEST"))
+                .andExpect(jsonPath("$.message")
+                        .value("Request body is missing or malformed"))
+                .andExpect(jsonPath("$.retryable").value(false))
+                .andExpect(jsonPath("$.cause").doesNotExist())
+                .andExpect(jsonPath("$.stackTrace").doesNotExist());
+
+        verifyNoInteractions(executionService, queryService);
+    }
+
+    @Test
+    void shouldHideFencingIdentityWhenExecutionLeaseIsLost()
+            throws Exception {
+        AgentResumeCommand command = new AgentResumeCommand(
+                "task-1",
+                7,
+                null,
+                null
+        );
+        when(executionService.resume(command)).thenThrow(
+                new AgentExecutionLeaseLostException(
+                        "task-1",
+                        42,
+                        AgentExecutionLeaseLostException.Reason
+                                .OWNER_OR_TOKEN_MISMATCH
+                )
+        );
+
+        mockMvc.perform(post("/api/agent/v1/tasks/task-1/resume")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"expectedRevision\":7}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.code")
+                        .value("EXECUTION_LEASE_LOST"))
+                .andExpect(jsonPath("$.taskId").value("task-1"))
+                .andExpect(jsonPath("$.retryable").value(false))
+                .andExpect(jsonPath("$.fencingToken").doesNotExist())
+                .andExpect(jsonPath("$.ownerId").doesNotExist())
+                .andExpect(jsonPath("$.reason").doesNotExist())
+                .andExpect(jsonPath("$.cause").doesNotExist())
+                .andExpect(jsonPath("$.stackTrace").doesNotExist());
+
+        verifyNoInteractions(queryService);
     }
 
     @Test

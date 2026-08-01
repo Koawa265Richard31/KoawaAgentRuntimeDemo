@@ -2,7 +2,7 @@ package com.koawa.agent.agent.api;
 
 import com.koawa.agent.agent.checkpoint.query.AgentTaskQueryService;
 import com.koawa.agent.agent.checkpoint.query.AgentTaskView;
-import org.springframework.http.ResponseEntity;
+import com.koawa.agent.agent.exception.CheckpointNotFoundException;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -25,12 +25,11 @@ public final class AgentTaskController {
     }
 
     @GetMapping("/tasks/{taskId}")
-    public ResponseEntity<AgentTaskView> getTask(
+    public AgentTaskView getTask(
             @PathVariable String taskId
     ) {
         return queryService.findByTaskId(taskId)
-                .map(ResponseEntity::ok)
-                .orElseGet(() -> ResponseEntity.notFound().build());
+                .orElseThrow(() -> new CheckpointNotFoundException(taskId));
     }
 
     @GetMapping("/conversations/{conversationId}/tasks")

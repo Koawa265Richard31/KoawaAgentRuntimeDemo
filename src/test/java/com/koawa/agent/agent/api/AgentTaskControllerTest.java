@@ -35,7 +35,9 @@ class AgentTaskControllerTest {
         queryService = mock(AgentTaskQueryService.class);
         mockMvc = standaloneSetup(
                 new AgentTaskController(queryService)
-        ).build();
+        )
+                .setControllerAdvice(new AgentApiExceptionHandler())
+                .build();
     }
 
     @Test
@@ -75,7 +77,13 @@ class AgentTaskControllerTest {
                 .thenReturn(Optional.empty());
 
         mockMvc.perform(get("/api/agent/v1/tasks/missing"))
-                .andExpect(status().isNotFound());
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.code").value("TASK_NOT_FOUND"))
+                .andExpect(jsonPath("$.message")
+                        .value("Task checkpoint was not found"))
+                .andExpect(jsonPath("$.taskId").value("missing"))
+                .andExpect(jsonPath("$.retryable").value(false))
+                .andExpect(jsonPath("$.violations", hasSize(0)));
     }
 
     @Test

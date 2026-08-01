@@ -3029,3 +3029,162 @@ ExecutionResult 是应用层内部协议，其中 Recovered 持有 Snapshot Reco
 validation、stale revision、active lease、interrupt consumption、lease lost 和 checkpoint
 lifecycle failure 的 HTTP 状态、可重试提示及敏感字段边界。本切片不同时开始 PostgreSQL
 重启 E2E。
+
+## 2026-08-01：M0-S5d 统一 API 错误合同
+
+### 本切片目标
+
+M0-S5c 已经固定 Resume 的正常返回分支，但异常仍会落入 Spring 默认错误响应。默认响应会让
+客户端依赖异常类名或文本，也可能把内部并发、持久化和租约细节暴露到 HTTP 边界。本切片新增
+统一的 `AgentApiError` 与 `AgentApiExceptionHandler`，为 Agent API 固定：
+
+- HTTP 状态：表达 HTTP 层的错误类别；
+- `code`：供客户端稳定分支处理，不依赖可修改的英文消息；
+- `taskId`：错误能安全定位任务时返回；
+- `retryable`、`retryAt`：说明是否存在安全的恢复路径；
+- `expectedRevision`、`actualRevision`：帮助客户端处理 CAS 冲突；
+- `violations`：结构化返回请求字段错误。
+
+本切片没有改变 Resume 状态机、Lease、Fencing、Checkpoint 保存流程，也没有开始 Conversation
+Store。
+
+### 公共错误结构
+
+revision 冲突示例：
+
+```json
+{
+  "code": "CHECKPOINT_REVISION_CONFLICT",
+  "message": "Task revision has changed; reload before resuming",
+  "taskId": "task-1",
+  "retryable": true,
+  "expectedRevision": 7,
+  "actualRevision": 8,
+  "violations": []
+}
+```
+
+可选字段为 null 时不输出；`violations` 始终是非 null 数组，客户端无需同时处理 null 和空数组。
+record 紧凑构造器还保证 code/message 合法、revision 非负，并对集合执行防御性复制。
+
+### 异常映射矩阵
+
+| 来源 | HTTP | 稳定 code | retryable | 公开的恢复信息 |
+| --- | ---: | --- | --- | --- |
+| Bean/方法参数校验失败 | 400 | `VALIDATION_FAILED` | false | 排序后的字段错误 |
+| JSON 缺失或无法解析 | 400 | `MALFORMED_REQUEST` | false | 安全的固定消息 |
+| Checkpoint 不存在 | 404 | `TASK_NOT_FOUND` | false | taskId |
+| revision CAS 冲突 | 409 | `CHECKPOINT_REVISION_CONFLICT` | 发现 actual 时 true | expected/actual revision |
+| 已有活跃执行 Lease | 409 | `TASK_EXECUTION_CONFLICT` | true | retryAt |
+| 用户输入不再匹配当前 Interrupt | 409 | `INTERRUPT_CONSUMPTION_CONFLICT` | true | taskId |
+| 执行期间丢失 Lease | 409 | `EXECUTION_LEASE_LOST` | false | taskId 与重新读取提示 |
+| Checkpoint 生命周期保存失败 | 503 | `CHECKPOINT_PERSISTENCE_FAILED` | false | 安全的固定消息 |
+| 已存 Snapshot 无法解码 | 500 | `CHECKPOINT_CORRUPTED` | false | taskId |
+| 未分类异常 | 500 | `INTERNAL_ERROR` | false | 安全的固定消息 |
+
+`retryable=true` 不表示客户端应原样无限重放请求。它表示存在明确恢复路径：revision/Interrupt
+冲突先 GET 最新 Task，再用新边界构造请求；执行权冲突至少等到 `retryAt`。Lease 丢失和保存
+失败被标为 false，因为模型或工具副作用是否发生可能未知，盲目重放会造成重复成本或重复副作用。
+
+### Rejected 与 AgentApiError 的边界
+
+`AgentResumeResponse.Rejected` 仍然是 Resume 应用服务正常返回的业务结果，例如任务已经终态或
+当前 Interrupt 不接受这次输入。Controller 已获得一个合法结果，并能重新查询权威 Task View，
+因此它继续返回带 `outcome=REJECTED` 的公共 Resume 响应。
+
+`AgentApiError` 处理的是异常路径，例如请求无法解析、读取不到 Checkpoint、并发 CAS 竞争、
+Lease 竞争或持久化失败。两者虽然都可能使用 HTTP 409，但语义不同：前者是状态机作出的显式
+拒绝决定，后者是请求处理过程中抛出的错误。HTTP 状态不能取代响应体中的稳定类型。
+
+### 为什么不能直接返回异常 message
+
+内部异常常包含数据库错误、JSON 内容、ownerId、fencingToken、Lease 丢失原因或底层 cause。
+这些数据既不是稳定 API，也可能泄露实现和敏感输入。因此 Advice 只返回预先定义的安全消息：
+
+- Lease Lost 不公开 ownerId、fencingToken 和内部 reason；
+- 持久化失败不公开 SQLException 或底层 cause；
+- JSON 解析失败不回显 parser 的内部诊断和原始正文；
+- 兜底 500 不公开异常 message、cause 或 stack trace。
+
+当前兜底日志只记录异常类型，避免日志测试意外写入输入内容。这也意味着生产可观测性仍需后续
+增加受控的 correlation/trace id 和结构化内部诊断，不能依赖向客户端暴露堆栈来排障。
+
+### Task GET 的变化
+
+`GET /api/agent/v1/tasks/{taskId}` 成功时仍直接返回 `AgentTaskView` 和 200；不存在时由 Controller
+抛出 `CheckpointNotFoundException`，Advice 返回 404 + `TASK_NOT_FOUND`。HTTP 状态没有改变，
+但空 404 变成了可供客户端稳定处理的错误合同。
+
+### 已执行确认
+
+- 编译：`mvn -q -DskipTests compile` 通过。
+- 定向 API 测试：15 tests，0 failures，0 errors，0 skipped。
+- 相关 Resume/Task Query/Lifecycle/Spring Context：59 tests，0 failures，0 errors，0 skipped。
+- 全量回归：188 tests，0 failures，0 errors，14 skipped。
+- MockMvc 已确认 malformed JSON 和字段校验均返回 400 稳定错误体。
+- 测试已确认 Lease Lost 响应不包含 ownerId、fencingToken、reason、cause 或 stackTrace。
+- 测试已确认 revision 冲突公开 expected/actual，活跃 Lease 冲突只公开 retryAt。
+
+### 尚未验证与限制
+
+- 全量 14 个 skipped 仍为既有 PostgreSQL/Testcontainers 用例；本机 Docker 环境当前不可用。
+- 本切片没有新增数据库语义；异常映射主要由单元测试和 MockMvc 验证，不能替代真实 PostgreSQL
+  Resume E2E。
+- `CHECKPOINT_PERSISTENCE_FAILED` 的内部异常当前不携带安全 taskId，因此公共响应无法定位任务。
+- 目前没有 correlation/trace id，也没有认证与任务所有权边界。
+- 客户端退避算法、最大重试次数和幂等键还没有形成公共协议；`retryable` 只是服务端安全提示。
+
+### 面试问题
+
+#### 问题一：为什么同时需要 HTTP 状态和稳定错误 code？
+
+参考回答：
+
+HTTP 状态适合网关、监控和通用客户端判断大类，例如 400、404、409、500；但一个 409 可能是
+revision 冲突、活跃 Lease、Interrupt 变化或 Lease Lost。稳定 code 才能让业务客户端选择重新
+读取、等待 retryAt 或停止重试，同时避免依赖可修改的 message。
+
+#### 问题二：为什么 Rejected 不统一改成 AgentApiError？
+
+参考回答：
+
+Rejected 是 Resume 状态机的合法结果，应用服务正常完成并返回了拒绝原因，Controller 还能
+附带权威 Task View。AgentApiError 表达异常路径。保留两类协议可以区分“业务明确拒绝”和
+“请求处理失败”，而不是把所有 409 压成同一种错误。
+
+#### 问题三：为什么不向客户端返回原始异常 message 和 stack trace？
+
+参考回答：
+
+原始异常文本不是稳定合同，可能包含 SQL、内部类、ownerId、fencingToken、用户输入或凭据。
+公共 API 应返回预定义的安全消息和结构化恢复信息；内部排障应依赖受控日志、指标和 trace id，
+而不是把实现细节泄露给调用方。
+
+#### 问题四：为什么 Lease Lost 的 retryable 是 false？
+
+参考回答：
+
+Lease Lost 往往发生在执行已经开始之后。旧 Worker 可能已经调用模型或外部工具，只是失去了
+写回资格；此时原样重试可能重复成本或副作用。客户端应先重新读取权威任务状态，再由更高层
+策略决定是否发起新命令，不能把它当成安全的自动重试。
+
+#### 问题五：为什么 Checkpoint 保存失败返回 503，却仍标记 retryable=false？
+
+参考回答：
+
+503 表示当前服务未能可靠完成持久化，便于基础设施监控识别暂时性服务故障；但单次请求是否
+可以安全重放取决于此前是否已经产生模型或工具副作用。HTTP 503 与请求级安全重试不是一回事，
+所以在没有幂等键和副作用账本保证前保持 false。
+
+#### 问题六：为什么字段错误要排序？
+
+参考回答：
+
+校验框架收集约束的顺序不应成为公共合同。按 field/message 排序让响应、快照测试和客户端日志
+保持确定性，减少同一错误因遍历顺序不同而产生的无意义差异。
+
+### 下一切片
+
+M0 主线尚余真实 PostgreSQL 重启 E2E 和 Conversation Store 持久化。Docker 恢复后应优先完成
+PostgreSQL Resume/重启闭环；若继续暂时绕开环境阻塞，下一切片可先收敛 Conversation Store 的
+领域端口与持久化边界，但 PostgreSQL 行为在 Testcontainers 通过前只能标记为尚未验证。
