@@ -3749,3 +3749,152 @@ oldest-first。只做 `ASC LIMIT N` 会取成最旧 N 个，只做 `DESC` 又会
 等待项目负责人审阅并接受 ADR-004。批准后进入 `M0-S5g`：先实现类型化 Turn/Input 协议、
 Flyway schema、JDBC Conversation Store，以及真实 PostgreSQL 的幂等与同会话排序测试；不在同一
 切片接入 terminal lifecycle。
+
+## 2026-08-01：M0-S5f 补充裁决——M3 前协议升级门禁
+
+### 用户新增的硬约束
+
+项目负责人明确要求：后续协议必须升级并完成适配，不能把协议债拖到 M3 面试交付之后；如果无法
+一次完成完整适配，当前阶段先采用准确表达现有语义的方案，不能上线半套新协议。
+
+为减少 M3 工具实现后的整体返工，实际截止点前移为：
+
+```text
+M0：Turn-row 当前语义基线
+  ↓
+M1：canonical v2 协议 + 全路径 adapter
+  ↓ M1-S7 首次验收
+M2：Workspace Kernel
+  ↓
+M3-S1 入口：最终 go/no-go
+```
+
+`M1-S7` 未通过时不开始 M3，而是保留 M0 可交付路径并回到缺失的适配切片。这里的 fallback 是
+“不做半迁移”，不是允许旧单 Action 主路径继续支撑一套新的 Coding Tools。
+
+### 为什么统一协议不等于所有数据写一张表
+
+本轮把容易混淆的四层拆开：
+
+| 层 | 职责 | 是否跨 Task |
+|---|---|---|
+| `OutputItem` | Provider 返回的原生 text/tool-call/reasoning 等语义项 | 否 |
+| `ModelContextItem` | 当前 Task 下一轮模型需要看到的 message、tool-call echo、tool-result | 否 |
+| `RunItem` | 模型、Policy、审批、工具、验证组成的 Runtime 时间线 | 否 |
+| `ConversationTurn` | 用户输入与可交付 ASSISTANT 输出的长期投影 | 是 |
+
+`TraceEvent` 是 RunItem 后续用于持久化和查询的表示。不能把 RunItem 全量塞进 Prompt，也不能从
+Trace 临时猜 Conversation；反过来，Conversation Turn 也无法恢复当前 Task 内的 tool-call/result
+关系。Usage 由 turn-level `ModelUsage` 表达，不属于某个 `OutputItem`。
+
+关键数据流是：
+
+```text
+Provider response
+  → canonical ModelTurn / OutputItem
+  → v2 Runtime 产生 ModelContextItem + RunItem
+  → Snapshot v2 保存当前 Task 恢复所需 items/refs
+  → terminal canonical deliverable message
+  → ADR-004 ConversationTurn（跨 Task）
+```
+
+因此物理 Turn-row 可以继续存在：它是跨 Task 的 read model，不是假装自己是完整 RunItem Store。
+协议是否升级成功，要看 canonical v2 是否真正成为 Provider、Loop、Snapshot、Resume 和
+Conversation projection 的主路径，而不是看表名有没有从 `turn` 改成 `item`。
+
+### 什么叫完整适配
+
+不能只新增几个 record 就宣布完成。M3 Gate 至少检查：
+
+- Provider fixture 能无损得到 `ModelTurn`，responseId、toolCallId、usage 和 finish reason 不丢。
+- 默认 Runtime 不再走 `String → AgentActionParser`。
+- 单回合多个 ToolCall 保持 callId/顺序，ToolResult 能关联原调用。
+- Runtime 产生带 taskId、runId、sequence、timestamp 的 RunItem。
+- Snapshot v2 能恢复当前 Task 的 message/tool context，旧 v1 Snapshot 仍可读或明确迁移。
+- Chat、ASK、Resume、FINAL、terminal repair 都从 canonical deliverable message 写同一个 Turn 真源。
+- 下一 Task 能把旧 Turn-row 投影回 canonical ModelContextItem。
+- typed stream delta 能聚合出与非流式一致的 ModelTurn；SSE/WebSocket 仍留到 M8。
+- 固定回放和 PostgreSQL 重启/事务测试通过；Testcontainers skip 不能过 Gate。
+
+`AgentRunResult` 可以继续作为 REST 同步结果 DTO，但不再承担持久化协议职责。
+
+### fallback 的精确范围
+
+允许：
+
+- M0/M1 迁移期间继续使用类型化 `ConversationTurn + Turn-row`。
+- 通过明确 adapter 把 Turn 投影为 canonical ModelContextItem。
+- 等 canonical 协议稳定后再决定是否需要物理 Message/Item-row。
+
+禁止：
+
+- Turn 和 Item 两个 writer 同时写、却没有共同事务或唯一真源。
+- 不同读路径随机从 Turn 或 RunItem 推导历史。
+- Provider v2 失败后静默回退文本 JSON。
+- Snapshot 写 v2 却不能读 v1。
+- 核心 ModelTurn/ToolCall v2 未完成，仍进入 M3 实现第二套工具链。
+
+### 规划修改
+
+- Execution Plan 升级到 v1.2，并在 `.agents/CHANGELOG.md` 记录项目负责人裁决。
+- M0-S5 明确 Turn-row 只是符合当前语义的过渡方案。
+- M1-S2 新增 OutputItem/ModelContextItem/RunItem/Conversation/Trace 分层。
+- 新增 `M1-S7a/b1/b2/c`，分别负责默认主路径切换、Snapshot/Resume 恢复适配、terminal 与
+  Conversation 投影、流式 fixture 与 Gate 审计。
+- M1 出口增加全路径与 PostgreSQL 证据；M3-S1 增加硬 Gate。
+- M3 出口要求保留一份从 ModelTurn、多 ToolCall 到 Coding Tools、RunItem、Final 的固定 E2E
+  面试证据。
+
+### 已执行确认
+
+- 已核对现有计划原本按 `M0 → M1 → M2 → M3` 严格推进，但此前只要求“定义协议”，没有把
+  Conversation/Resume/Snapshot/Streaming 的完整适配写成显式 Gate。
+- 已核对当前 `ChatMessage`、`AgentConversationStore`、`AgentRunResult` 仍是 v1/兼容边界。
+- 已更新 Execution Plan v1.2、治理变更记录、ADR-004 和本开发记录。
+- 本轮只修改文档，没有修改生产代码、Migration 或测试。
+
+### 尚未验证
+
+- M1-S1 到 M1-S7 尚未实施，当前主路径仍是文本 JSON 单 `AgentAction`。
+- 当前 Snapshot 仍为 v1，尚不能恢复 canonical ModelContextItem/RunItem。
+- 尚无 typed streaming fixture 或 M3 Gate 自动审计。
+- ADR-004 仍为 Proposed；本补充裁决不等于批准其全部数据库实现细节。
+
+### 面试问题
+
+#### 问题一：为什么 RunItem 不能直接作为 Conversation History？
+
+参考回答：
+
+RunItem 是 task-scoped 的运行事实，包含 Policy、审批、工具执行和验证；把它全量回灌下一次模型
+Prompt 会暴露内部事件并重复上下文。ConversationTurn 只保存跨 Task 可见的用户输入和可交付
+输出。两者可由同一 canonical runtime 产生，但服务不同读取模型。
+
+#### 问题二：继续使用 Turn-row，为什么仍能说协议已经升级？
+
+参考回答：
+
+协议升级看的是 Provider、Loop、Snapshot、Resume 和 Context 是否统一使用 canonical v2 类型。
+Turn-row 是 terminal deliverable 的持久化投影，只要写入来自 canonical message、读取能适配回
+ModelContextItem，它无需为了表面统一改成 Item-row。物理 schema 应由实际查询与原子性决定。
+
+#### 问题三：为什么把截止点放在 M3-S1，而不是 M3 完成前？
+
+参考回答：
+
+M3 的 Coding Tools 必须直接消费 v2 tool call/result。如果先用旧单 Action 接口完成工具，再改
+协议，就要重做调用 ID、结果关联、Snapshot 和 Resume。入口 Gate 把兼容成本留在 M1，M3 可以
+直接积累可展示的端到端证据。
+
+#### 问题四：fallback 为什么不能让 v1 AgentAction 继续进入 M3？
+
+参考回答：
+
+那会产生 v1 与 v2 两套工具链，测试和恢复语义分叉，正好破坏面试交付。fallback 只保持
+Conversation Turn 的当前物理语义，核心 ModelTurn/ToolCall v2 仍是 M3 硬门禁；未完成就回到
+M1-S7，而不是掩盖缺口。
+
+### 下一步
+
+当前仍等待项目负责人接受 ADR-004。接受后继续 `M0-S5g`，先按当前真实语义完成类型化 Turn、
+Flyway/JDBC Store 与 PostgreSQL 证据；M1-S7 作为后续强制适配 Gate，不提前混入 M0。

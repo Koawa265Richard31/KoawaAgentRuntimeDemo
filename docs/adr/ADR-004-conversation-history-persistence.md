@@ -4,6 +4,10 @@
 
 Proposed（2026-08-01，等待项目负责人批准后进入实现）
 
+补充裁决（2026-08-01）：项目负责人要求后续统一协议及全路径适配必须在 M3 交付前完成；
+Execution Plan v1.2 将最终 Gate 前移到 `M3-S1` 入口。若 Conversation 的物理 Item-row 无法完整
+迁移，继续使用本 ADR 的 Turn-row 和明确 adapter；这不豁免核心 ModelTurn/ToolCall v2 门禁。
+
 对应范围：
 
 - `M0-S5`：用持久化 Conversation Store 替换进程内历史，并完成重启后的跨 Task 上下文恢复。
@@ -118,7 +122,9 @@ Resume 路径还有更直接的遗漏：`AgentInterruptConsumptionService` 只�
 - 需要再设计 `turn_id`、Turn 完成标记、角色顺序和两行之间的幂等关系。
 - M0 当前只持久化一个用户输入和一个可交付输出，灵活性尚未带来实际收益。
 
-该方案更适合 M1 以后形成统一 Run Item 协议时重新评估，本阶段不采用。
+M1 必须升级 canonical Model/Context/RunItem 协议，但这不自动要求跨 Task Conversation 改成
+message-row。只有未来需要持久化一个 terminal boundary 下多个独立可交付 item 时，才通过独立
+ADR 重新评估物理表；M0 不采用。
 
 ### 方案 B：每个完整 Turn 一行
 
@@ -134,9 +140,11 @@ Resume 路径还有更直接的遗漏：`AgentInterruptConsumptionService` 只�
 缺点：
 
 - 不保存没有可交付输出的孤立输入。
-- 未来若允许一个输入产生多个独立 ASSISTANT item，需要升级协议或拆成 message/item 表。
+- 未来若跨 Task Conversation 需要一个输入对应多个独立可交付 ASSISTANT item，需要升级投影或
+  拆成 message/item 表。
 
-该方案最符合 M0 现有语义，采用。
+该方案最符合 M0 现有语义，采用。M1 完成 canonical v2 协议升级后，只要 adapter 能从 canonical
+deliverable message 稳定写入 Turn、并把旧 Turn 投影回模型上下文，它仍可作为跨 Task read model。
 
 ### 方案 C：从 Checkpoint 动态投影
 
@@ -357,6 +365,48 @@ ORDER BY turn_sequence ASC;
   turnSequence、outcome 和冲突类型。
 - M0 不实现加密、TTL、归档或 GDPR 删除工作流，但这些缺口必须保留在里程碑风险清单。
 
+### 9. 协议升级与 M3 入口门禁
+
+M0 的 Turn-row 只解决当前跨 Task 可见历史，不能代替 M1 的统一协议。后续必须保持四个边界：
+
+```text
+Provider OutputItem
+  ├─→ ModelContextItem：当前 Task 下一轮模型要看到的 message/tool-call echo/tool-result
+  └─→ Runtime RunItem：taskId/runId/sequence 下的模型、Policy、工具、验证运行事实
+
+canonical deliverable USER / ASSISTANT
+  └─→ ConversationTurn：跨 Task 的用户可见持久化投影
+
+RunItem
+  └─→ TraceEvent：后续持久化、查询和流式交互表示
+```
+
+`RunItem` 不能全量回灌 Prompt，也不能临时充当 Conversation 表；Conversation Turn 又不能代替
+当前 Task 的 tool-call/tool-result context 或运行审计。
+
+Execution Plan v1.2 新增 `M1-S7`。进入 `M3-S1` 前，“完整适配”至少满足：
+
+- 已注册 Provider Adapter 无损输出 canonical `ModelTurn`，默认 Runtime 不再走
+  `String → AgentActionParser` 主路径。
+- 一个 ModelTurn 的多 ToolCall 保留 callId 和顺序，ToolResult 能关联原 callId。
+- v2 loop 产生有序 RunItem；Snapshot v2 能重建当前 Task 的 message/tool context，v1 Snapshot
+  有兼容读取或明确迁移。
+- 首次 Chat、ASK、Resume、FINAL、terminal-step recovery 都从 canonical deliverable message
+  写入同一个 Turn 真源；重启后 Turn 又能投影为 canonical ModelContextItem。
+- typed stream delta 可以确定性聚合为与非流式等价的 ModelTurn；SSE/WebSocket 传输仍留在 M8。
+- 固定回放、旧数据兼容和 PostgreSQL 重启/事务测试通过，Testcontainers skip 不算通过。
+
+Fallback 只允许保持 Conversation 的当前物理语义：
+
+- 协议尚未稳定时不做 dual writer、半切换或猜测性的 Message/Item-row migration。
+- Turn-row 继续作为唯一跨 Task Conversation 真源，旧 `ChatMessage` 只在反腐 adapter 内出现。
+- `AgentRunResult` 继续作为 REST 结果投影，不成为持久化协议。
+- 物理 item-row 不是 M3 Gate 的完成指标；完整 adapter 可以继续使用 Turn-row。
+- 核心 `ModelTurn/ToolCall` v2 未完成时必须返回 M1-S7，不得借 fallback 进入 M3 建第二套工具链。
+
+因此“先采用符合当前语义的方案”保证 M0 可交付且不做半套迁移；“后续协议必须升级”则由
+M1-S7 和 M3 入口 Gate 强制执行，两者不是互相替代关系。
+
 ## 后果
 
 正向后果：
@@ -374,7 +424,8 @@ ORDER BY turn_sequence ASC;
 - Snapshot 需要新增可恢复的 `CurrentTurnInput` 协议及兼容处理。
 - 当前内存历史无法迁移；部署前已经丢失的数据也不能从 Snapshot 无歧义补回。
 - 本决策不解决同一 Conversation 在模型执行阶段的并发，也不提供工具 Exactly Once。
-- 未来统一 Run Item/Streaming 协议可能需要把 Turn-row 升级为 Message/Item-row。
+- M1 必须完成 canonical ModelContextItem/RunItem/Streaming 协议及全路径 adapter；Turn-row 是否物理
+  升级为 Message/Item-row 由可交付 Conversation 语义决定，不再把“换表”误当成协议完成。
 
 ## 验证计划
 
@@ -406,6 +457,16 @@ ORDER BY turn_sequence ASC;
 
 H2 或 Mock 只可验证组件协议，不得把结果表述为 PostgreSQL 事务、行锁或 Flyway 已验证。
 
+### M1-S7 协议 Gate 验证
+
+- M0 Turn 能投影为 canonical USER/ASSISTANT ModelContextItem，顺序与内容不变。
+- canonical deliverable message 在首次 Chat、Resume 和 terminal recovery 中产生相同 Turn identity。
+- 多 ToolCall 的 ModelContextItem/RunItem/ToolResult 关联在 Snapshot v2 重启后不丢失。
+- v1 Snapshot 与旧 Turn-row fixture 能由 v2 主路径读取；旧公共 REST JSON 保持兼容。
+- 主 Runtime 测试证明不再调用 `AgentActionParser`；兼容路径必须单独命名和测试。
+- 固定流式 delta 聚合结果与非流式 ModelTurn 相同。
+- `M1-S7` 任一项未通过时，M3 Gate 返回失败且不注册 M3 Coding Tools。
+
 ### 待补验切片
 
 为遵守单切片文件数与故障语义边界，批准 ADR 后拆为：
@@ -415,6 +476,8 @@ H2 或 Mock 只可验证组件协议，不得把结果表述为 PostgreSQL 事�
 2. `M0-S5h`：统一 terminal committer，接入初次 Chat、Resume、terminal repair，并完成事务故障
    注入测试。
 3. `M0-S5i`：真实 PostgreSQL 重启 E2E、跨 Task 历史验收、README/M0 出口证据收口。
+4. `M1-S7`：按 Execution Plan v1.2 完成 canonical v2 主路径、Snapshot/Resume/Conversation adapter、
+   typed stream fixture 与 M3 入口 Gate；它不并入 M0 实现提交。
 
 每个切片独立提交；任何 PostgreSQL 用例因 Docker 跳过时必须明确标记“尚未验证”，不能完成 M0。
 
