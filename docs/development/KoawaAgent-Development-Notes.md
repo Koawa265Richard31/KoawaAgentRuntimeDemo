@@ -3411,3 +3411,341 @@ Snapshot。
 语义，先以 DESIGN 模式起草 ADR，比较“每条 Message 一行”“每个 Turn 一行”和“从 Checkpoint
 投影重建”至少三种方案，确定 Turn identity、排序、事务/修复和保留策略。ADR 批准后再拆 JDBC
 实现与 PostgreSQL/Testcontainers 验证；不与真实 Resume 重启 E2E 混在同一提交。
+
+## 2026-08-01：M0-S5f Conversation Store 持久化设计
+
+### 本切片结果
+
+本切片以 DESIGN 模式新增：
+
+- `docs/adr/ADR-004-conversation-history-persistence.md`
+
+没有修改生产代码、Flyway migration 或测试。ADR 状态为 `Proposed`，需要项目负责人批准后才能
+进入 JDBC 实现。
+
+本轮确定四个核心结论：
+
+1. Checkpoint 是单 Task 恢复真源，Conversation Turn 是跨 Task 历史真源，两者独立建模。
+2. M0 使用“每个完整 Turn 一行”，不使用 message-row，也不从 latest-only Snapshot 动态投影。
+3. Turn 幂等身份是 `(taskId, terminalStepIndex)`，不是 `taskId` 或 revision。
+4. 可交付 terminal Checkpoint 与 Turn 必须在同一个 PostgreSQL 事务提交；首次 Chat、Resume 和
+   terminal-step recovery 必须使用同一个 terminal committer。
+
+### 当前双写为什么不安全
+
+当前首次 Chat 实际顺序是：
+
+```java
+// DefaultAgentChatService
+checkpointLifecycle.completed(completedState);
+return AgentRunResult.from(completedState);
+
+// 回到 AgentChatFacade 后
+conversationStore.appendTurn(
+        result.conversationId(),
+        userId,
+        question,
+        result.content()
+);
+```
+
+`completed` 已经把 Task 改成 `COMPLETED` 或 `WAITING_FOR_INPUT`。`appendTurn` 在另一个组件、另一个
+调用栈位置执行，中间没有共同事务：
+
+```text
+Checkpoint 终态提交成功
+  ↓ 进程在这里崩溃
+Conversation Turn 尚未追加
+```
+
+重启后 Task 看起来已经正确结束，现有 Recovery 不会再修它，但下一 Task 又读不到刚才的回答。
+这不是“概率很低就可以忽略”的窗口，而是两个独立提交必然存在的结构性不一致。
+
+Resume 路径更明显：
+
+```java
+try (execution) {
+    AgentState terminalState = runner.run(
+            execution.state(),
+            execution.checkpointLifecycle()
+    );
+    lifecycle.completed(terminalState);
+    return new AgentResumeExecutionResult.Executed(
+            AgentRunResult.from(terminalState)
+    );
+}
+```
+
+它根本没有 Conversation Store 依赖。所以用户回复澄清后，后续 ASK 或 FINAL 虽然进入当前 Task
+Checkpoint，却不会成为下一个 Task 的持久化历史。
+
+### 三种存储粒度如何选择
+
+#### Message-row
+
+```text
+row 1: USER      question
+row 2: ASSISTANT answer
+```
+
+它适合未来任意 role/item 流，但 M0 一次 Turn 至少要 INSERT 两行，还要补 `turnId`、角色顺序和
+“两行全部完成才可见”的约束。当前并没有使用这部分灵活性。
+
+#### Turn-row（本轮选择）
+
+```text
+one row:
+  inputContent + outputContent
+  taskId + terminalStepIndex
+  inputType + sourceInterruptId
+  outputType + turnSequence
+```
+
+一行天然保持一组 USER/ASSISTANT 同时可见，读取时再展开为两个 `ChatMessage`。它与当前
+`appendTurn(question, answer)` 和最近 10 个完整 Turn 的行为一致。
+
+#### Checkpoint projection
+
+当前 Snapshot 中的 `historySnapshot` 是“创建 Task 时加载的旧历史副本 + Resume 用户回复”，历次
+ASK 输出却在 Step observation 中。每个 Task 又会复制旧历史，直接扫描必然重复；多次
+ASK/Resume 也缺少完整的逐 Turn 输入引用。因此它不能无歧义成为会话查询真源。
+
+### 为什么幂等键是 taskId + terminalStepIndex
+
+具体例子：一个 Task 经历两次澄清再完成：
+
+```text
+task-42 / step 1 / ASK_CLARIFICATION
+task-42 / step 4 / ASK_CLARIFICATION
+task-42 / step 7 / FINAL_ANSWER
+```
+
+只用 `taskId=task-42` 做唯一键，第二次 ASK 和 FINAL 都会被误判为重复。revision 也不合适：
+
+```text
+step 7 保存后 revision = 10，status 仍 RUNNING
+terminal lifecycle 保存后 revision = 11
+Recovery 重放时读到的 expectedRevision 又可能不同
+```
+
+revision 表达“Snapshot 写到了第几个版本”，terminal Step index 表达“是哪一个业务输出”。所以
+稳定身份是：
+
+```sql
+UNIQUE (task_id, terminal_step_index)
+```
+
+冲突时不能直接 `ON CONFLICT DO NOTHING`。必须读取既有行并比较不可变 payload：相同表示重放，
+不同表示代码缺陷或数据损坏，应抛类型化一致性异常并让整个 terminal transaction 回滚。
+
+顺序也很重要：必须先锁住 Conversation Head，再查询幂等键；既有 payload 相同就直接复用，不能
+先把 `nextTurnSequence` 加一再发现重复。否则每次正常重放都会凭空制造 sequence 空洞。数据库
+唯一约束是异常竞态的最后防线；不能指望捕获 UNIQUE 异常后在同一 PostgreSQL 事务继续工作，
+因为该事务已经进入失败状态。
+
+### 为什么还要显式保存 CurrentTurnInput
+
+terminal Step 只稳定保存 ASSISTANT 输出。第一次 Chat 的 USER 输入是 `originalQuestion`，Resume
+后的 USER 输入来自刚消费的 Interrupt。若只在提交时寻找 `historySnapshot` 的“最后一个 USER”，
+会让恢复正确性依赖 List 的偶然排列。
+
+ADR 因此要求恢复状态显式携带：
+
+```text
+CurrentTurnInput(
+    content,
+    ORIGINAL_QUESTION | INTERRUPT_REPLY,
+    sourceInterruptId
+)
+```
+
+初次 Task 初始化它；`AgentInterruptConsumptionService` 在验证 interruptId、revision 和 userInput
+后原子替换它。terminal Step 即使已经保存后进程重启，Recovery 仍能用相同输入和 Step 生成同一
+Turn。现有 `consumedUserInputStep` 仍保留，它解决的是“旧 ASK 是否已被消费”的恢复歧义，不负责
+保存完整的当前输入来源。
+
+### 新的原子提交边界
+
+后续实现不再由 Facade 事后追加历史，而是统一成：
+
+```text
+terminal Step 已保存：RUNNING, revision N
+  ↓
+@Transactional terminalCommit(...)
+  ├─ Checkpoint CAS / Fenced Write
+  │    RUNNING revision N → COMPLETED/WAITING revision N+1
+  ├─ 锁定 Conversation Head
+  ├─ 先核对既有 Turn identity/payload
+  └─ 仅新 Turn 推进 sequence 并 INSERT
+  ↓
+commit：三者同时可见
+```
+
+如果任一步抛异常，PostgreSQL 回滚整个事务，持久状态仍停在“terminal Step 已保存、Task RUNNING”。
+现有 Recovery 正好能识别这个边界；但 Recovery 的修复动作也必须改为调用同一个
+`terminalCommit`，否则仍会漏 Turn。
+
+这段设计只让数据库投影对每个 terminal boundary 幂等，不会消除模型或工具已经消耗的成本，
+也不宣称外部副作用 Exactly Once。
+
+### Conversation Head 是什么
+
+若只使用全局自增 ID，回滚会产生序列空洞，而且两个并发事务得到 ID 的顺序不等于它们最终
+提交的顺序。M0 对同一 Conversation 使用一条很小的 Head 记录：
+
+```text
+agent_conversation_head
+  (conversationId, userId) → nextTurnSequence
+```
+
+terminal transaction 执行：
+
+```sql
+-- 锁内先按 (task_id, terminal_step_index) 核对是否为相同重放；
+-- 只有不存在时才分配新顺序。
+UPDATE agent_conversation_head
+SET next_turn_sequence = next_turn_sequence + 1
+WHERE conversation_scope_id = ?
+RETURNING next_turn_sequence;
+```
+
+PostgreSQL 会锁住这一行。并发完成同一 Conversation 的两个 Task 会短暂串行，不同 Conversation
+不会互相阻塞。这里定义的是数据库最终持久化顺序，不是 HTTP 请求到达顺序。该锁只覆盖很短的
+数据库提交，不跨模型或工具调用。
+
+“一 Turn 一行”还必须由数据库约束兑现，而不能只靠 Java 构造器：身份、type、输入、输出和时间
+字段使用 `NOT NULL`；step 非负、sequence 为正；`ORIGINAL_QUESTION` 必须没有
+`sourceInterruptId`，`INTERRUPT_REPLY` 必须带非空的 source。这样 JDBC 缺陷、人工 SQL 或未来
+writer 也不能落下半个 Turn。
+
+还要明确它没有阻止两个 Task 在更早阶段同时读取旧历史并调用模型。若产品要求同一 Conversation
+只能运行一个 Task，需要未来增加 Conversation-level Claim，不能把 Turn 排序误称为执行互斥。
+
+### 最近 10 个 Turn 怎么读取
+
+不能直接 `ORDER BY sequence ASC LIMIT 10`，那会取最旧 10 个。正确形状是：
+
+```sql
+SELECT *
+FROM (
+    SELECT *
+    FROM agent_conversation_turn
+    WHERE conversation_scope_id = ?
+    ORDER BY turn_sequence DESC
+    LIMIT 10
+) recent
+ORDER BY turn_sequence ASC;
+```
+
+内层从尾部取最新 10 个 Turn，外层恢复 oldest-first，再把每行展开成 USER、ASSISTANT 两条消息。
+持久化表不因为上下文窗口只有 10 个 Turn 就立即删除旧记录；M6 可以改用 token 预算重新选择，
+不会被 M0 的物理裁剪锁死。
+
+### 崩溃对照
+
+| 位置 | 数据库结果 | 后续行为 |
+|---|---|---|
+| terminal Step 前崩溃 | 最近非 terminal Snapshot | 从最近边界继续 |
+| Step 已保存、terminal transaction 前崩溃 | RUNNING + terminal Step，无 Turn | Recovery 重新提交终态和 Turn |
+| terminal transaction 中途失败 | 两个写都回滚 | 与上一行相同 |
+| transaction 提交后响应丢失 | 终态和 Turn 同时存在 | 查询已完成；相同 identity 幂等 |
+| identity 相同但 payload 不同 | 整体回滚 | 报一致性错误，不覆盖 |
+
+### 成熟框架给了什么、没给什么
+
+- LangGraph 明确分开 Checkpointer 和跨 Thread Store，支持我们拆分职责。
+- OpenAI Agents SDK Session 明确区分已加载历史和本次新增 item，支持显式追加边界。
+- PostgreSQL 官方事务、唯一约束和行锁文档支持原子提交、幂等约束与同会话顺序设计。
+
+但这些资料没有替 KoawaAgent 证明当前 Spring 事务是否真的覆盖所有 `JdbcTemplate` 写入，也没有
+证明 Fencing、并发 Head 更新和进程重启组合正确。它们目前是 E1/E2 设计证据，后续必须用
+Testcontainers 故障注入补 E3，才能完成 M0。
+
+### 已执行确认
+
+- 已核对首次 Chat 的 `completed → Facade.appendTurn` 调用顺序。
+- 已核对 Resume 和 terminal-step recovery 当前都不写 Conversation Store。
+- 已核对 Snapshot 是每 Task latest-only，且 `historySnapshot` 混合旧历史与 Resume 输入。
+- 已比较 message-row、turn-row、checkpoint projection 和 outbox 四种方案。
+- 已形成 ADR-004，状态保持 Proposed。
+- 提交前设计复核已补齐“重放先核对再分配 sequence”、数据库行内约束和安全回滚边界。
+- 本切片为纯文档设计，没有执行或修改生产测试。
+
+### 尚未验证与限制
+
+- 尚未创建 `agent_conversation_head`、`agent_conversation_turn` 或 JDBC Store。
+- 尚未证明 Spring transaction 能覆盖 Checkpoint/Fenced Write/Turn 三类写入。
+- 尚未用 PostgreSQL 验证 `UNIQUE NULLS NOT DISTINCT`、行锁排序、重复 payload 和故障回滚。
+- Docker daemon 的可用性需在实现切片重新检查；跳过 Testcontainers 不能视为通过。
+- 当前运行时仍使用内存 Store，重启继续丢失 Conversation History。
+- ADR 未获项目负责人批准前，不修改生产协议。
+
+### 面试问题
+
+#### 问题一：为什么不能直接从 Checkpoint 读取聊天历史？
+
+参考回答：
+
+Checkpoint 面向单 Task Resume，保存 latest-only 执行状态；Conversation History 面向多个 Task
+组装模型上下文。当前 Snapshot 会复制旧历史，Resume 输入和 ASK 输出又分散在不同字段，直接
+投影会重复或错配。两个真源按访问模式和生命周期拆分，terminal boundary 再用事务保持一致。
+
+#### 问题二：为什么选择一 Turn 一行，而不是一 Message 一行？
+
+参考回答：
+
+M0 的最小不变量是一个 USER 输入与一个可交付 ASSISTANT 输出成对可见。一 Turn 一行用单个
+INSERT 就保持原子对；Message-row 需要额外事务、turnId 和角色完整性约束。未来统一 Run Item
+协议需要更多消息类型时可以升级，但当前不为未使用的灵活性增加恢复复杂度。
+
+#### 问题三：为什么 revision 不能当 Turn 的幂等键？
+
+参考回答：
+
+revision 是 Snapshot 的 CAS 版本，初始化、每个 Step、Interrupt 消费和终态保存都会改变它；同一
+terminal Step 在恢复前后对应的 revision 也可能不同。terminalStepIndex 才是稳定业务边界，结合
+taskId 又能区分同一 Task 的多次 ASK 和最终答案。
+
+#### 问题四：`ON CONFLICT DO NOTHING` 为什么仍可能掩盖错误？
+
+参考回答：
+
+唯一键冲突既可能是相同请求重放，也可能是同一 Step 被错误地生成了不同输入或输出。盲目忽略会
+把后者伪装成成功。正确做法是比较既有行和待写 payload；完全一致才幂等成功，不一致则类型化
+报错并回滚终态提交。
+
+#### 问题五：为什么 terminal Step 与终态仍然分两次保存？
+
+参考回答：
+
+Step 是已完成执行的恢复边界，先保存它能避免进程在生命周期收尾时崩溃后重新调用模型或工具。
+随后用短事务原子写终态和 Conversation Turn。崩溃时最多停在“terminal Step + RUNNING”，
+Recovery 可只补提交边界，不重做昂贵执行。
+
+#### 问题六：Conversation Head 行锁会不会像 Lease 一样锁住整个 Worker？
+
+参考回答：
+
+不会。Lease 覆盖一次可能包含模型和工具调用的执行期；Head 行锁只存在于最终几个 SQL 的短事务
+中，用来分配同会话 sequence。它不跨网络调用，不同 Conversation 也锁不同 Head 行。
+
+#### 问题七：事务提交成功但 HTTP 响应丢失，算 Exactly Once 吗？
+
+参考回答：
+
+只能说数据库 Turn 对 `(taskId, terminalStepIndex)` 是幂等、最多一条；客户端可通过 Task 查询看到
+已提交结果。模型或工具可能在更早阶段被重复调用，外部系统副作用也不受这个唯一键控制，因此
+不能把局部数据库幂等夸大成端到端 Exactly Once。
+
+#### 问题八：为什么读取最近 N 条要两次排序？
+
+参考回答：
+
+`DESC LIMIT N` 才能从尾部取最新 N 个 Turn，但模型上下文需要按时间正序。外层再 `ASC` 恢复
+oldest-first。只做 `ASC LIMIT N` 会取成最旧 N 个，只做 `DESC` 又会把上下文倒序。
+
+### 下一切片
+
+等待项目负责人审阅并接受 ADR-004。批准后进入 `M0-S5g`：先实现类型化 Turn/Input 协议、
+Flyway schema、JDBC Conversation Store，以及真实 PostgreSQL 的幂等与同会话排序测试；不在同一
+切片接入 terminal lifecycle。
