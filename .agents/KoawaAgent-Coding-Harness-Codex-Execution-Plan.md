@@ -4,9 +4,9 @@
 >
 > 当前技术栈：Java 17、Spring Boot 3.5、PostgreSQL、JDBC/Flyway、MCP Java SDK
 >
-> 文档版本：v1.1
+> 文档版本：v1.2
 >
-> 编制日期：2026-07-25（v1.1 修订：2026-07-26，见 `.agents/CHANGELOG.md`）
+> 编制日期：2026-07-25（v1.2 修订：2026-08-01，见 `.agents/CHANGELOG.md`）
 >
 > 文档用途：作为编码代理后续编码的唯一阶段路线、切片边界、验收标准和停止条件
 >
@@ -536,6 +536,16 @@ M0 → M1 → M2 → M3 → M4 → M5 → M6 → M7 → M8 → M9 → M10 → M1
 - 会话历史持久化：替换 `InMemoryAgentConversationStore`，重启后跨任务对话历史
   可恢复（2026-07-26 补充；在此之前 M0 的"重启恢复"仅覆盖单任务 Snapshot）。
 
+过渡裁决（2026-08-01）：
+
+- M0 先按当前运行时的真实语义保存类型化完整 Turn：一个 USER 输入和一个
+  `FINAL_ANSWER`/`ASK_CLARIFICATION` 可交付输出。
+- Turn 必须保留稳定来源身份，至少能用 `taskId + terminalStepIndex` 幂等覆盖首次 Chat、
+  ASK、Resume、FINAL 和 terminal-step recovery。
+- M0 不臆测 M1 的 `ModelContextItem`、`OutputItem` 或 `RunItem` 物理表结构；当前 Turn-row 是
+  可交付 Conversation 投影，不是完整运行 Trace。
+- 该过渡方案不得被解释为跳过 M1 全链路协议升级；M3 入口仍受 §9 的硬门禁约束。
+
 里程碑出口：
 
 - 所有 M0 测试通过。
@@ -585,10 +595,23 @@ ModelFinishReason
 区分：
 
 ```text
-Model output item
-Runtime run item
-Persistent trace event
+Provider OutputItem
+ModelContextItem
+Runtime RunItem
+Conversation Turn projection
+Persistent TraceEvent
 ```
+
+职责必须明确：
+
+- `OutputItem` 是 Provider 返回的原生语义项。
+- `ModelContextItem` 是下一次模型请求需要看到的规范上下文，至少能表达 user/assistant message、
+  tool-call echo 和 tool-result；不能退化为一个拼接字符串。
+- `RunItem` 是单 Task 的权威运行时间线，除消息外还包含 policy、approval、tool execution、
+  verification 等 Runtime 事实。
+- `Conversation Turn` 是跨 Task 的用户可见投影，只保存用户输入和可交付 ASSISTANT 输出；不得把
+  RunItem 全量回灌 Prompt，也不得从 Trace 临时猜 Conversation。
+- `TraceEvent` 是 RunItem 的持久化/查询表示，不等于模型上下文。
 
 RunItem 至少支持：
 
@@ -601,11 +624,15 @@ RunItem 至少支持：
 - Context compacted。
 - Verification started/completed。
 - Run completed。
+- Model text delta。
+- Tool arguments delta。
+- Model turn failed。
 
 要求：
 
 - 每个事件带 taskId、runId、sequence、timestamp。
 - sequence 由 Runtime 生成，不由模型提供。
+- 流式 delta、排序和聚合必须是类型化协议；M1 不提前实现 SSE/WebSocket、断线续传或 CLI 展示。
 
 ### M1-S3：OpenAI Responses Provider Adapter
 
@@ -615,7 +642,7 @@ RunItem 至少支持：
 - 原生 function tool schema。
 - 文本、tool call、usage、response ID 映射。
 - 错误分类。
-- 流式事件先实现最小版本或明确推迟到 M1-S5。
+- 流式响应的 typed delta 映射可先实现最小版本，但聚合、回放和 Gate 统一在 M1-S7c 收口。
 
 要求：
 
@@ -667,11 +694,51 @@ invoke model
 - v1 路径弃用说明。
 - 删除 v1 之前必须有功能等价测试。
 
+### M1-S7：全链路协议适配与 M3 入口 Gate
+
+默认拆分执行：
+
+- M1-S7a：默认 Runtime 切换到 `ModelTurn v2 + ModelContextItem + RunItem`，旧
+  `AgentActionParser` 只保留隔离兼容入口。
+- M1-S7b1：Snapshot v2 保存重建当前 Task model context 所需的 items/refs，并适配 Resume 与
+  terminal-step recovery。
+- M1-S7b2：canonical deliverable message、terminal committer 与 Conversation Store 全路径适配；
+  M0 Turn-row 通过明确投影兼容跨 Task 历史。
+- M1-S7c：固定流式 Provider fixture、typed delta 聚合、重放和最终 Gate 审计。
+
+完整适配必须覆盖：
+
+- 所有已注册 Provider Adapter 输出 canonical `ModelTurn`，保留 responseId、toolCallId、usage、
+  finish reason 和 provider metadata。
+- 默认 loop 实际消费 `ModelTurn`，多 ToolCall 的 callId、顺序和 ToolResult 关联在正常执行与恢复
+  后一致。
+- Runtime 实际产生有序 RunItem；v2 Snapshot 能恢复当前 Task 的 message/tool context，v1
+  Snapshot 可兼容读取或明确迁移。
+- 首次 Chat、ASK、Resume、FINAL、terminal-step recovery 都从 canonical deliverable message
+  生成同一 Conversation 投影，无遗漏、重复或双真源。
+- 下一 Task 能把 M0 Turn-row 投影回 canonical `ModelContextItem`；`AgentRunResult` 只保留为 API
+  结果投影，不得成为持久化协议。
+- 固定流式响应能聚合为与非流式等价的最终 `ModelTurn`。产品级 SSE/WebSocket 仍属于 M8。
+
+回退规则：
+
+- 协议尚未完整适配时，禁止半切换、dual writer 或猜测性 Message/Item-row migration；继续使用
+  ADR-004 的类型化 Turn-row 作为唯一跨 Task Conversation 真源。
+- Conversation 的物理 Turn-row 可以在完整 adapter 下继续存在；“协议已升级”以 canonical v2
+  主路径和全链路行为为准，不以是否换成 item-row 表为准。
+- 回退只适用于 Conversation 的持久化形状，不豁免核心 `ModelTurn/ToolCall` v2 门禁。M1-S7 未
+  通过时不得进入 M3，不能一边保留 v1 工具动作主路径一边实现第二套 Coding Tools。
+
 里程碑出口：
 
 - Runtime 不再依赖模型返回手写 JSON Action。
 - OpenAI/Anthropic 至少一个真实 smoke test 可人工运行。
 - 单回合多个工具调用可被完整记录。
+- `ModelContextItem`、RunItem、Snapshot/Resume 和 Conversation projection 已按 M1-S7 全路径接入，
+  旧 `ChatMessage`/`AgentAction` 只存在于明确兼容层。
+- PostgreSQL/Testcontainers 证明 Conversation terminal transaction、幂等冲突、重启恢复和并发
+  顺序；因 Docker 跳过不得通过出口。
+- 固定流式 fixture 的 typed delta 可确定性聚合和回放。
 - 建立 3–5 个固定评测场景与回放脚本（M11 最小前置，2026-07-26 补充）。
   此后任何 Prompt、协议、Context policy 或循环算法变更都必须先回放这些场景。
 
@@ -732,6 +799,20 @@ WorkspaceAccessViolation
 ---
 
 ## 9. M3：Coding Tools
+
+### M3 入口硬门禁（2026-08-01）
+
+开始 `M3-S1` 前必须重新审计并确认 M1 里程碑出口全部通过，尤其包括：Provider Adapter、默认
+v2 Runtime、多 ToolCall 关联、RunItem、Snapshot/Resume、Conversation projection 和 typed
+stream aggregation。任一项未完成：
+
+- 不得开始 M3-S1。
+- 不得以 ADR-004 的 M0 Turn-row 过渡实现作为核心协议豁免。
+- 保持当前可交付语义和唯一数据真源，返回 M1-S7 完成缺失适配，禁止把协议债带入 Coding Tools。
+
+该门禁早于“在 M3 完成前补协议”的最晚要求，目的是避免搜索、Patch、Git、Diagnostics 建在旧
+`AgentAction` 主路径上后整体返工。物理 Conversation item-row、Run Items 查询 API、SSE/WebSocket
+和断线续传不属于本门禁，分别由独立 ADR/后续 M8 切片决定。
 
 ### 工具统一协议
 
@@ -835,6 +916,8 @@ DiagnosticRange
 里程碑出口：
 
 - Agent 可以安全完成“搜索 → 阅读 → Patch → 查看 diff → 诊断”闭环。
+- 至少一个固定 E2E 能展示 `ModelTurn → 多 ToolCall → Coding Tools → RunItem → Final` 的关联，
+  并保留 taskId、runId、toolCallId、sequence 和验证证据，作为面试交付材料。
 
 ---
 
