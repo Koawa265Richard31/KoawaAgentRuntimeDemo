@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.koawa.agent.agent.domain.AgentAction;
+import com.koawa.agent.agent.domain.AgentConversationTurnInput;
 import com.koawa.agent.agent.domain.AgentFailureType;
 import com.koawa.agent.agent.domain.AgentObservation;
 import com.koawa.agent.agent.domain.AgentState;
@@ -37,6 +38,12 @@ public final class AgentTaskSnapshotMapper {
     static final String ERROR_MESSAGE = "errorMessage";
     static final String CONSUMED_USER_INPUT_STEP =
             "consumedUserInputStep";
+    static final String CURRENT_TURN_INPUT_TYPE =
+            "currentTurnInputType";
+    static final String CURRENT_TURN_INPUT_CONTENT =
+            "currentTurnInputContent";
+    static final String CURRENT_TURN_SOURCE_INTERRUPT_ID =
+            "currentTurnSourceInterruptId";
 
     private static final TypeReference<Map<String, Object>> STRING_OBJECT_MAP =
             new TypeReference<>() {
@@ -92,6 +99,8 @@ public final class AgentTaskSnapshotMapper {
                 .taskId(snapshot.taskId())
                 .userId(snapshot.userId())
                 .originalQuestion(snapshot.originalQuestion())
+                .currentTurnInput(readCurrentTurnInput(snapshot))
+                .checkpointRevision(snapshot.revision())
                 .currentStep(snapshot.nextStep())
                 .maxSteps(snapshot.maxSteps())
                 .deadlineAt(snapshot.deadlineAt())
@@ -196,7 +205,73 @@ public final class AgentTaskSnapshotMapper {
                         ? null
                         : state.getConsumedUserInputStep().toString()
         );
+        putCurrentTurnInput(context, state.getCurrentTurnInput());
         return Map.copyOf(context);
+    }
+
+    private void putCurrentTurnInput(
+            Map<String, String> context,
+            AgentConversationTurnInput input
+    ) {
+        if (input == null) {
+            return;
+        }
+        context.put(CURRENT_TURN_INPUT_TYPE, input.type().name());
+        context.put(CURRENT_TURN_INPUT_CONTENT, input.content());
+        putIfNotNull(
+                context,
+                CURRENT_TURN_SOURCE_INTERRUPT_ID,
+                input.sourceInterruptId()
+        );
+    }
+
+    private AgentConversationTurnInput readCurrentTurnInput(
+            AgentTaskSnapshot snapshot
+    ) {
+        Map<String, String> context = snapshot.recoveryContext();
+        boolean hasType = context.containsKey(CURRENT_TURN_INPUT_TYPE);
+        boolean hasContent = context.containsKey(
+                CURRENT_TURN_INPUT_CONTENT
+        );
+        boolean hasSource = context.containsKey(
+                CURRENT_TURN_SOURCE_INTERRUPT_ID
+        );
+        if (!hasType && !hasContent && !hasSource) {
+            if (context.containsKey(CONSUMED_USER_INPUT_STEP)) {
+                if (snapshot.status() == AgentTaskStatus.RUNNING) {
+                    throw new AgentTaskSnapshotMappingException(
+                            "legacy consumed RUNNING input cannot be "
+                                    + "restored without its source interrupt"
+                    );
+                }
+                return null;
+            }
+            return AgentConversationTurnInput.originalQuestion(
+                    snapshot.originalQuestion()
+            );
+        }
+        if (!hasType || !hasContent) {
+            throw new AgentTaskSnapshotMappingException(
+                    "current turn input recovery context is incomplete"
+            );
+        }
+
+        try {
+            AgentConversationTurnInput.Type type = Enum.valueOf(
+                    AgentConversationTurnInput.Type.class,
+                    context.get(CURRENT_TURN_INPUT_TYPE)
+            );
+            return new AgentConversationTurnInput(
+                    type,
+                    context.get(CURRENT_TURN_INPUT_CONTENT),
+                    context.get(CURRENT_TURN_SOURCE_INTERRUPT_ID)
+            );
+        } catch (IllegalArgumentException | NullPointerException exception) {
+            throw new AgentTaskSnapshotMappingException(
+                    "invalid current turn input recovery context",
+                    exception
+            );
+        }
     }
 
     private List<AgentStep> toAgentSteps(List<StepSnapshot> snapshots) {

@@ -4109,3 +4109,213 @@ terminal Checkpoint、幂等追加 Turn。先证明 Store 自身，再在下一�
 进入 `M0-S5h：统一 terminal committer 与运行路径接入`。它将把 terminal Checkpoint 与 Turn 放入
 同一 PostgreSQL 事务，并统一首次 Chat、Resume、terminal repair；需要故障注入证明任一步失败时
 两者一起回滚。本切片不会提前进入 M1 协议 v2。
+
+## 2026-08-03：M0-S5h 统一 terminal committer 与运行路径接入
+
+### 本切片结果
+
+本切片把可交付 terminal Checkpoint 与 Conversation Turn 收进同一个短事务，并接通首次 Chat、
+Resume、terminal-step recovery 三条路径。`AgentChatFacade` 不再事后追加 Turn；运行时
+`AgentConversationStore` 由 `@Primary JdbcAgentConversationStore` 提供，历史读取也进入 PostgreSQL。
+
+为遵守单切片最多 8 个生产文件的门限，没有新增一个只有薄转发逻辑的类，而是把 application-level
+terminal committer 放在现有 `AgentCheckpointService.commitTerminal(...)`。这使该 Service 的职责从
+“Checkpoint CRUD”扩大为“Checkpoint 应用服务 + terminal transaction 入口”，本轮可以接受，但
+后续不应继续把 lifecycle 判断下沉到 JDBC Store。
+
+### 两个新增的运行态字段
+
+`AgentState` 新增：
+
+```java
+private AgentConversationTurnInput currentTurnInput;
+private long checkpointRevision;
+```
+
+`currentTurnInput` 表示“要与下一次可交付 terminal Step 配成一个 Turn 的用户输入”：
+
+- 首次 `create` 写入 `ORIGINAL_QUESTION(originalQuestion)`；
+- 消费 USER_INPUT Interrupt 后替换为
+  `INTERRUPT_REPLY(command.userInput, persistedInterrupt.interruptId)`；
+- 连续 ASK 时，回复 interrupt-1 后产生 ASK-2，ASK-2 的 Turn input 仍是 reply-1；只有消费
+  interrupt-2 时才替换成 reply-2；
+- terminal recovery 只从 Snapshot 恢复这个字段，不从 `historySnapshot` 最后一条 USER 猜输入。
+
+为避免在 M0 提前升级 Snapshot v2，Mapper 把 type/content/sourceInterruptId 写入现有
+`recoveryContext`。全新 Snapshot 可以完整往返；旧 Snapshot 若尚未消费 Interrupt，可以安全回退为
+`ORIGINAL_QUESTION`。旧 Snapshot 若已有 `consumedUserInputStep` 却没有新 input keys，则真实来源
+interruptId 已经丢失：`RUNNING` Task 会明确拒绝继续，不伪造 ID；WAITING Task 仍可消费下一条
+合法 reply，并用新 reply/interruptId 覆盖未知旧输入；已经 terminal 的 Snapshot 仍可只读加载。
+当前仓库尚未发布这类 RUNNING 持久化数据；若未来存在升级部署，必须先排空或迁移它们。
+
+`checkpointRevision` 不是新的数据库字段，而是运行态的“来源版本”：
+
+```text
+Snapshot revision N
+  → Mapper 恢复 state.checkpointRevision = N
+  → Worker 基于这个 state 执行
+  → save/commitTerminal 必须 CAS expectedRevision = N
+  → 成功后回写 state.checkpointRevision = N + 1
+```
+
+如果只在保存时重新读取数据库最新 revision，再自动写 `latest + 1`，旧 Worker 可能借用新版本覆盖
+较新状态。显式携带来源 revision 后，旧 state 会得到 `CheckpointConflictException`，不会写 Turn。
+它也不能用 `planningRecoveryAttempts` 代替：规划恢复次数可能在最后一个 Step 落库后继续增加，
+ERROR/TIMEOUT 终态仍应基于同一个 Checkpoint revision 正常提交。
+
+### terminal transaction 的实际顺序
+
+`commitTerminal` 先在内存中验证 stopReason、目标 status、最后一个真实 terminal Step、
+`finalAnswer == observation.content`、CurrentTurnInput，以及 ASK 的
+`pendingInterrupt.prompt == Turn.outputContent`。随后进入共享 `TransactionTemplate`：
+
+```text
+加载当前 Checkpoint
+  → 校验 state.checkpointRevision / recovery expectedRevision
+  → 校验当前仍是同一个 RUNNING execution boundary
+  → CAS 或 Fenced Write 保存 terminal Checkpoint
+  → JdbcAgentConversationStore.appendTurn
+       └─ PROPAGATION_REQUIRED，加入同一个 DataSource transaction
+  → commit
+```
+
+Resume 在进入 transaction 前先 `leaseSession.requireActive()`，数据库写入时仍由
+`JdbcAgentFencedCheckpointWriter` 在同一 UPDATE 内检查 owner、fencingToken 和数据库到期时间。
+因此“心跳检查刚通过但 Lease 随后被接管”仍会在 Fenced Write 处失败，Turn 也不会提交。
+
+非可交付的 `CANCELLED/TIMEOUT/ERROR/MAX_STEPS` 仍通过同一个 terminal transaction 保存 Task
+status，但不会创建 Conversation Turn。FINAL 和 ASK 必须从最后一个 `AgentStep.stepIndex` 取得稳定
+身份，不再使用 Facade 的 `stepCount - 1` 推导。
+
+### 三条运行路径
+
+首次 Chat：
+
+```text
+DefaultAgentChatService
+  → lifecycle.initialize
+  → CheckpointService.create（初始化 ORIGINAL_QUESTION）
+  → Runner.stepCommitted（terminal Step 先保存为 RUNNING）
+  → lifecycle.completed
+  → commitTerminal（Checkpoint + Turn）
+```
+
+Resume：
+
+```text
+InterruptConsumptionService
+  → 保存 INTERRUPT_REPLY(content, sourceInterruptId)
+  → Claim Lease / Mapper 恢复 state + checkpointRevision
+  → Runner(..., executionLifecycle)
+  → fenced stepCommitted
+  → lifecycle.completed
+  → fenced commitTerminal（Checkpoint + Turn）
+```
+
+terminal-step recovery：
+
+```text
+restore(expectedRevision, permit)
+  → 发现 RUNNING + 最后 Step terminal
+  → 从 Step 恢复 stopReason/finalAnswer，ASK 只生成一次 interruptId
+  → commitTerminal(expectedRevision, permit)
+  → 返回 Recovered，不进入 Runner
+```
+
+`AgentSnapshotRecoveryService` 旧的仅接收 Store/FencedWriter 构造器已经标记 `@Deprecated`，只能做
+非 terminal 的只读恢复；它们不能表达跨 Store 原子事务。Spring 主路径和本切片 terminal 测试都
+使用显式注入 `AgentCheckpointService` 的构造器。
+
+### PostgreSQL 故障注入证据
+
+`PostgresAgentSnapshotRecoveryServiceTest` 使用同一个 `DriverManagerDataSource` 实例构造
+`JdbcTemplate`、`DataSourceTransactionManager`、Checkpoint Store、Fenced Writer、Conversation
+Store 和 terminal committer，并通过 Flyway V1-V3 建表。已验证：
+
+- FINAL recovery 只增加一个 terminal revision，并同时产生一个 Turn；
+- ASK 只生成一次 interruptId，`pendingInterrupt.prompt` 与 Turn output 完全相同；
+- Conversation Store 完成 INSERT 后注入异常，Checkpoint、Head、Turn、sequence 全部回滚；
+- 数据库 revision 已推进时，旧 `checkpointRevision` 不能覆盖 Snapshot，也不能创建 Turn；
+- Lease 已释放并被新 owner 接管时，旧 permit 的 Fenced Write 失败，Checkpoint 和 Turn 都不推进。
+
+### 已执行确认
+
+- 改动相关单元测试通过，覆盖 CurrentTurnInput 往返/兼容拒绝、Interrupt 消费、首次 lifecycle、
+  Resume execution、terminal recovery 和 Facade 不再拥有 Conversation 写入。
+- 定向 PostgreSQL/Testcontainers：5 tests、0 failure、0 error、0 skipped；数据库为
+  `postgres:16-alpine` / PostgreSQL 16.14。
+- 全量命令使用 Docker Desktop Engine 29.6.1，并显式传入 docker-java API 1.44：
+  `mvn -q "-Dapi.version=1.44" test`。
+- 全量结果：218 tests、0 failure、0 error、0 skipped；51 个 test suite report 全部通过。
+- 生产文件 8 个、测试文件 8 个、0 Migration；未修改 M1 v2 协议、Runner、Controller 或
+  `AgentTaskSnapshot` 顶层 schema。
+
+### 尚未验证与限制
+
+- 尚未做“进程退出、重建 Spring Context、恢复 terminal boundary、再创建下一 Task 并读取旧 Turn”
+  的真实重启 E2E；它属于 `M0-S5i`。
+- 当前同时存在 JDBC `@Primary` Bean 和内存 `@Component`，生产依赖解析会选择 JDBC；内存实现仅
+  保留为测试/兼容实现。后续收口可移除其生产组件身份，但不能把运行时降级回内存双写。
+- 旧的“已消费 Interrupt、但没有 CurrentTurnInput keys”的 v1 RUNNING Snapshot 无法无损恢复；
+  当前采取显式拒绝而不是猜测 sourceInterruptId。旧 WAITING Snapshot 可由下一次合法回复覆盖未知
+  input，terminal Snapshot 仍可只读。
+- M1 canonical ModelTurn/ModelContextItem/RunItem、Snapshot v2 与 typed streaming 仍未实施，继续
+  受 M3-S1 Gate 约束。
+
+### 面试问题
+
+#### 问题一：为什么 Checkpoint 和 Conversation 必须在一个事务里？
+
+参考回答：
+
+两者描述同一个可交付 terminal 事实。先提交 Checkpoint 再写 Conversation，进程可能在中间崩溃，
+导致 Task 已完成但下一 Task 看不到历史；先写 Conversation 也会产生历史可见但 Task 未完成。使用
+同一 DataSource 的短事务后，外部只能观察到“两者都存在”或“两者都不存在”。
+
+#### 问题二：checkpointRevision、数据库 revision 和 fencingToken 有什么区别？
+
+参考回答：
+
+数据库 revision 是 Task Snapshot 的 CAS 版本；`state.checkpointRevision` 是 Worker 当前 state 来源于
+哪个数据库 revision，用来形成 expectedRevision；fencingToken 是 Lease owner 世代，用来拒绝租约
+到期后的旧 Worker。revision 防状态覆盖，fencingToken 防失去执行权的 Worker 写回，两者必须同时
+满足。
+
+#### 问题三：为什么不能用 planningRecoveryAttempts 判断 state 是否陈旧？
+
+参考回答：
+
+它是业务恢复计数，不是持久化版本，而且可能在最后一次 Step 落库之后继续增加。如果把它要求与
+RUNNING Snapshot 完全相等，规划重试耗尽后的 ERROR 终态反而无法保存。陈旧性应由来源 revision
+CAS 判断；业务字段只用于核对同一个 execution boundary。
+
+#### 问题四：为什么 CurrentTurnInput 不能从 history 最后一条 USER 推断？
+
+参考回答：
+
+history 是创建 Task 时加载的旧上下文加 Resume 回复的混合副本，无法证明哪条 USER 与当前 terminal
+Step 配对，也不保存被消费 interruptId。CurrentTurnInput 在 Interrupt 校验成功时原子写入 type、
+content、sourceInterruptId，恢复时有唯一来源，连续 ASK 也不会串错输入。
+
+#### 问题五：为什么旧 consumed RUNNING Snapshot 选择失败，而不是伪造 interruptId？
+
+参考回答：
+
+Turn payload 和幂等冲突判断把 sourceInterruptId 当作不可变事实。伪造 ID 会让错误数据永久进入
+Conversation 真源，之后无法区分真实回复来源。对需要继续执行、却不可无损恢复的 RUNNING 数据
+显式失败，并在部署前排空或迁移，比“看似兼容但审计事实错误”更安全；WAITING Task 收到下一条
+合法 reply 后可以用真实的新 interruptId 覆盖，因此不需要一刀切拒绝。
+
+#### 问题六：为什么 Conversation Store 内部还有 TransactionTemplate？
+
+参考回答：
+
+Store 单独使用时需要本地事务保护 Head 锁、sequence 和 Turn；被 terminal committer 调用时，默认
+`PROPAGATION_REQUIRED` 会加入外层同一个事务，而不是另开事务。关键是两者必须使用同一个
+DataSource/TransactionManager 资源，不能改成 `REQUIRES_NEW`。
+
+### 下一步
+
+进入 `M0-S5i：真实 PostgreSQL 重启 E2E 与 M0 出口证据收口`。下一切片会重建应用上下文，验证
+terminal recovery、跨 Task 历史加载和 ASK → Resume → FINAL 在进程重启后仍只产生一次 Turn；
+不会提前进入 M1 协议 v2。

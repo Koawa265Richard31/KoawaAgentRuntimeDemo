@@ -36,8 +36,8 @@ Execution Plan v1.2 将最终 Gate 前移到 `M3-S1` 入口。若 Conversation �
   要求配合确定性的 `ORDER BY` 才能得到稳定子集。
 
 上述框架证据只证明“执行状态与会话历史应分离”“历史追加需要显式持久化边界”。它们没有替
-KoawaAgent 证明跨 Store 原子性、Exactly Once 或并发顺序；这些结论仍须在后续切片用
-PostgreSQL/Testcontainers 补 E3，故本 ADR 保持 Proposed。
+KoawaAgent 证明跨 Store 原子性、Exactly Once 或并发顺序；这些结论仍须在实现切片用
+PostgreSQL/Testcontainers 补 E3。这里是批准前的证据限制，不改变页首已经更新的 Accepted 状态。
 
 ## 背景
 
@@ -471,10 +471,10 @@ H2 或 Mock 只可验证组件协议，不得把结果表述为 PostgreSQL 事�
 
 为遵守单切片文件数与故障语义边界，批准 ADR 后拆为：
 
-1. `M0-S5g`：类型化 Turn/Input 协议、Flyway schema、JDBC Conversation Store 与
+1. `M0-S5g`（已完成）：类型化 Turn/Input 协议、Flyway schema、JDBC Conversation Store 与
    PostgreSQL 幂等/排序测试。
-2. `M0-S5h`：统一 terminal committer，接入初次 Chat、Resume、terminal repair，并完成事务故障
-   注入测试。
+2. `M0-S5h`（已完成）：统一 terminal committer，接入初次 Chat、Resume、terminal repair，并完成
+   PostgreSQL 事务故障注入测试。
 3. `M0-S5i`：真实 PostgreSQL 重启 E2E、跨 Task 历史验收、README/M0 出口证据收口。
 4. `M1-S7`：按 Execution Plan v1.2 完成 canonical v2 主路径、Snapshot/Resume/Conversation adapter、
    typed stream fixture 与 M3 入口 Gate；它不并入 M0 实现提交。

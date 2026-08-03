@@ -5,6 +5,7 @@ import com.koawa.agent.agent.checkpoint.snapshot.AgentCheckpointStore;
 import com.koawa.agent.agent.checkpoint.snapshot.AgentTaskSnapshotMapper;
 import com.koawa.agent.agent.checkpoint.snapshot.InMemoryAgentCheckpointStore;
 import com.koawa.agent.agent.domain.AgentActionType;
+import com.koawa.agent.agent.domain.AgentConversationTurnInput;
 import com.koawa.agent.agent.domain.AgentStopReason;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.InterruptType;
@@ -21,6 +22,7 @@ import org.junit.jupiter.api.Test;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -90,6 +92,13 @@ class AgentInterruptConsumptionServiceTest {
                 )
         );
         assertEquals(0, consumed.state().getConsumedUserInputStep());
+        assertEquals(
+                AgentConversationTurnInput.interruptReply(
+                        "repository-a",
+                        "interrupt-1"
+                ),
+                consumed.state().getCurrentTurnInput()
+        );
         assertNull(consumed.state().getStopReason());
         assertNull(consumed.state().getFinalAnswer());
 
@@ -102,6 +111,10 @@ class AgentInterruptConsumptionServiceTest {
                 restarted.state().getHistorySnapshot()
                         .get(1)
                         .getContent()
+        );
+        assertEquals(
+                consumed.state().getCurrentTurnInput(),
+                restarted.state().getCurrentTurnInput()
         );
     }
 
@@ -126,6 +139,26 @@ class AgentInterruptConsumptionServiceTest {
                 exception.getReason()
         );
         assertEquals(waiting, store.load("wrong-id-task").orElseThrow());
+    }
+
+    @Test
+    void shouldReplaceUnknownLegacyInputWhenConsumingNextInterrupt() {
+        save(waitingSnapshot(
+                "legacy-waiting-task",
+                Map.of("consumedUserInputStep", "0")
+        ));
+
+        AgentInterruptConsumptionResult consumed = service.consume(
+                command("legacy-waiting-task", "repository-b")
+        );
+
+        assertEquals(
+                AgentConversationTurnInput.interruptReply(
+                        "repository-b",
+                        "interrupt-1"
+                ),
+                consumed.state().getCurrentTurnInput()
+        );
     }
 
     @Test
@@ -221,6 +254,24 @@ class AgentInterruptConsumptionServiceTest {
     }
 
     private AgentTaskSnapshot waitingSnapshot(String taskId) {
+        return waitingSnapshot(taskId, Map.of());
+    }
+
+    private AgentTaskSnapshot waitingSnapshot(
+            String taskId,
+            Map<String, String> additionalRecoveryContext
+    ) {
+        Map<String, String> recoveryContext = new LinkedHashMap<>(
+                Map.of(
+                        "planningRecoveryAttempts",
+                        "0",
+                        "stopReason",
+                        AgentStopReason.ASK_CLARIFICATION.name(),
+                        "finalAnswer",
+                        "Which repository?"
+                )
+        );
+        recoveryContext.putAll(additionalRecoveryContext);
         return new AgentTaskSnapshot(
                 AgentTaskSnapshot.CURRENT_SCHEMA_VERSION,
                 taskId,
@@ -237,14 +288,7 @@ class AgentInterruptConsumptionServiceTest {
                         ChatMessage.Role.USER,
                         "earlier context"
                 )),
-                Map.of(
-                        "planningRecoveryAttempts",
-                        "0",
-                        "stopReason",
-                        AgentStopReason.ASK_CLARIFICATION.name(),
-                        "finalAnswer",
-                        "Which repository?"
-                ),
+                recoveryContext,
                 new PendingInterrupt(
                         "interrupt-1",
                         InterruptType.USER_INPUT,

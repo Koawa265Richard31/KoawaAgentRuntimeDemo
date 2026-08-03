@@ -30,8 +30,11 @@ import com.koawa.agent.agent.recovery.AgentRecoveryDecision;
 import com.koawa.agent.agent.runner.AgentCancellationChecker;
 import com.koawa.agent.agent.runner.AgentCheckpointLifecycle;
 import com.koawa.agent.agent.runner.AgentLoopRunner;
+import com.koawa.agent.agent.runtime.InMemoryAgentConversationStore;
+import com.koawa.agent.framework.convention.ChatMessage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.transaction.support.TransactionOperations;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -63,6 +66,7 @@ class AgentResumeExecutionServiceTest {
     private InMemoryAgentExecutionLeaseStore leaseStore;
     private AgentResumeClaimService claimService;
     private AtomicInteger fencedWrites;
+    private InMemoryAgentConversationStore conversationStore;
 
     @BeforeEach
     void setUp() {
@@ -82,6 +86,7 @@ class AgentResumeExecutionServiceTest {
                         clock
                 );
         fencedWrites = new AtomicInteger();
+        conversationStore = new InMemoryAgentConversationStore();
         AgentFencedCheckpointWriter fencedWriter =
                 (snapshot, expectedRevision, permit) -> {
                     fencedWrites.incrementAndGet();
@@ -96,7 +101,9 @@ class AgentResumeExecutionServiceTest {
                         checkpointStore,
                         mapper,
                         clock,
-                        fencedWriter
+                        fencedWriter,
+                        conversationStore,
+                        TransactionOperations.withoutTransaction()
                 );
         claimService = new AgentResumeClaimService(
                 new AgentResumeService(checkpointStore),
@@ -110,7 +117,7 @@ class AgentResumeExecutionServiceTest {
                         mapper,
                         clock,
                         () -> "recovered-interrupt",
-                        fencedWriter
+                        checkpointService
                 ),
                 leaseStore,
                 checkpointService,
@@ -190,6 +197,13 @@ class AgentResumeExecutionServiceTest {
         assertEquals(2, saved.steps().size());
         assertEquals(2, fencedWrites.get());
         assertEquals(
+                List.of(
+                        ChatMessage.user("resume task"),
+                        ChatMessage.assistant("final answer")
+                ),
+                conversationStore.load("conversation-1", "user-1")
+        );
+        assertEquals(
                 NOW,
                 leaseStore.load("executed-task")
                         .orElseThrow()
@@ -262,6 +276,13 @@ class AgentResumeExecutionServiceTest {
         );
         verifyNoInteractions(runner);
         assertEquals(1, fencedWrites.get());
+        assertEquals(
+                List.of(
+                        ChatMessage.user("resume task"),
+                        ChatMessage.assistant("already finished")
+                ),
+                conversationStore.load("conversation-1", "user-1")
+        );
         assertEquals(
                 NOW,
                 leaseStore.load("recovered-task")

@@ -10,11 +10,16 @@ import com.koawa.agent.agent.checkpoint.resume.AgentResumeExecutionService;
 import com.koawa.agent.agent.checkpoint.resume.AgentResumeService;
 import com.koawa.agent.agent.checkpoint.resume.AgentSnapshotRecoveryService;
 import com.koawa.agent.agent.checkpoint.snapshot.*;
+import com.koawa.agent.agent.conversation.JdbcAgentConversationStore;
 import com.koawa.agent.agent.runner.AgentLoopRunner;
+import com.koawa.agent.agent.service.AgentConversationStore;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 import java.time.Clock;
 
@@ -56,17 +61,33 @@ public class AgentCheckpointConfiguration {
     }
 
     @Bean
+    @Primary
+    public AgentConversationStore agentConversationStore(
+            JdbcTemplate jdbcTemplate,
+            PlatformTransactionManager transactionManager
+    ) {
+        return new JdbcAgentConversationStore(
+                jdbcTemplate,
+                transactionManager
+        );
+    }
+
+    @Bean
     public AgentCheckpointService agentCheckpointService(
             AgentCheckpointStore store,
             AgentTaskSnapshotMapper mapper,
             Clock clock,
-            AgentFencedCheckpointWriter fencedWriter
+            AgentFencedCheckpointWriter fencedWriter,
+            AgentConversationStore conversationStore,
+            PlatformTransactionManager transactionManager
     ) {
         return new AgentCheckpointService(
                 store,
                 mapper,
                 clock,
-                fencedWriter
+                fencedWriter,
+                conversationStore,
+                new TransactionTemplate(transactionManager)
         );
     }
 
@@ -105,13 +126,13 @@ public class AgentCheckpointConfiguration {
             AgentCheckpointStore store,
             AgentTaskSnapshotMapper mapper,
             Clock clock,
-            AgentFencedCheckpointWriter fencedWriter
+            AgentCheckpointService checkpointService
     ) {
         return new AgentSnapshotRecoveryService(
                 store,
                 mapper,
                 clock,
-                fencedWriter
+                checkpointService
         );
     }
 

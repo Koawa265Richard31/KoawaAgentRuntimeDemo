@@ -1,6 +1,7 @@
 package com.koawa.agent.agent.checkpoint.resume;
 
 import com.koawa.agent.agent.checkpoint.lease.AgentExecutionPermit;
+import com.koawa.agent.agent.checkpoint.snapshot.AgentCheckpointService;
 import com.koawa.agent.agent.checkpoint.snapshot.AgentCheckpointStore;
 import com.koawa.agent.agent.checkpoint.snapshot.AgentFencedCheckpointWriter;
 import com.koawa.agent.agent.checkpoint.snapshot.AgentTaskSnapshotMapper;
@@ -27,8 +28,8 @@ import java.util.function.Supplier;
  *
  * <p>The service never executes a planner or action handler. A non-terminal
  * RUNNING snapshot is returned at its persisted {@code nextStep}. When the
- * last committed step is terminal but the task is still RUNNING, only the
- * missing lifecycle revision is written.
+ * last committed step is terminal but the task is still RUNNING, the missing
+ * lifecycle revision and deliverable conversation turn are committed.
  */
 public final class AgentSnapshotRecoveryService {
 
@@ -36,8 +37,13 @@ public final class AgentSnapshotRecoveryService {
     private final AgentTaskSnapshotMapper mapper;
     private final Clock clock;
     private final Supplier<String> interruptIdSupplier;
-    private final AgentFencedCheckpointWriter fencedWriter;
+    private final AgentCheckpointService checkpointService;
 
+    /**
+     * @deprecated Use a constructor that receives {@link AgentCheckpointService};
+     * this compatibility overload can only restore non-terminal boundaries.
+     */
+    @Deprecated(forRemoval = true)
     public AgentSnapshotRecoveryService(
             AgentCheckpointStore store,
             AgentTaskSnapshotMapper mapper
@@ -47,10 +53,15 @@ public final class AgentSnapshotRecoveryService {
                 mapper,
                 Clock.systemUTC(),
                 () -> UUID.randomUUID().toString(),
-                null
+                (AgentCheckpointService) null
         );
     }
 
+    /**
+     * @deprecated Use a constructor that receives {@link AgentCheckpointService};
+     * this compatibility overload can only restore non-terminal boundaries.
+     */
+    @Deprecated(forRemoval = true)
     public AgentSnapshotRecoveryService(
             AgentCheckpointStore store,
             AgentTaskSnapshotMapper mapper,
@@ -62,10 +73,15 @@ public final class AgentSnapshotRecoveryService {
                 mapper,
                 clock,
                 interruptIdSupplier,
-                null
+                (AgentCheckpointService) null
         );
     }
 
+    /**
+     * @deprecated A fenced writer cannot atomically append the Conversation
+     * Turn. Supply the application-level checkpoint service instead.
+     */
+    @Deprecated(forRemoval = true)
     public AgentSnapshotRecoveryService(
             AgentCheckpointStore store,
             AgentTaskSnapshotMapper mapper,
@@ -77,7 +93,51 @@ public final class AgentSnapshotRecoveryService {
                 mapper,
                 clock,
                 () -> UUID.randomUUID().toString(),
-                fencedWriter
+                (AgentCheckpointService) null
+        );
+        Objects.requireNonNull(
+                fencedWriter,
+                "fencedWriter cannot be null"
+        );
+    }
+
+    /**
+     * @deprecated A fenced writer cannot atomically append the Conversation
+     * Turn. Supply the application-level checkpoint service instead.
+     */
+    @Deprecated(forRemoval = true)
+    public AgentSnapshotRecoveryService(
+            AgentCheckpointStore store,
+            AgentTaskSnapshotMapper mapper,
+            Clock clock,
+            Supplier<String> interruptIdSupplier,
+            AgentFencedCheckpointWriter fencedWriter
+    ) {
+        this(
+                store,
+                mapper,
+                clock,
+                interruptIdSupplier,
+                (AgentCheckpointService) null
+        );
+        Objects.requireNonNull(
+                fencedWriter,
+                "fencedWriter cannot be null"
+        );
+    }
+
+    public AgentSnapshotRecoveryService(
+            AgentCheckpointStore store,
+            AgentTaskSnapshotMapper mapper,
+            Clock clock,
+            AgentCheckpointService checkpointService
+    ) {
+        this(
+                store,
+                mapper,
+                clock,
+                () -> UUID.randomUUID().toString(),
+                checkpointService
         );
     }
 
@@ -86,7 +146,7 @@ public final class AgentSnapshotRecoveryService {
             AgentTaskSnapshotMapper mapper,
             Clock clock,
             Supplier<String> interruptIdSupplier,
-            AgentFencedCheckpointWriter fencedWriter
+            AgentCheckpointService checkpointService
     ) {
         this.store = Objects.requireNonNull(
                 store,
@@ -104,7 +164,7 @@ public final class AgentSnapshotRecoveryService {
                 interruptIdSupplier,
                 "interruptIdSupplier cannot be null"
         );
-        this.fencedWriter = fencedWriter;
+        this.checkpointService = checkpointService;
     }
 
     public AgentSnapshotRecoveryResult restore(
@@ -178,13 +238,6 @@ public final class AgentSnapshotRecoveryService {
             StepSnapshot terminalStep,
             AgentExecutionPermit permit
     ) {
-        if (current.revision() == Long.MAX_VALUE) {
-            throw new IllegalStateException(
-                    "checkpoint revision limit reached for task "
-                            + current.taskId()
-            );
-        }
-
         Instant updatedAt = monotonicUpdatedAt(current.updatedAt());
         AgentTaskStatus targetStatus;
         PendingInterrupt pendingInterrupt;
@@ -211,25 +264,24 @@ public final class AgentSnapshotRecoveryService {
             );
         }
 
-        AgentTaskSnapshot repaired = mapper.toSnapshot(
-                state,
-                targetStatus,
-                current.revision() + 1,
-                pendingInterrupt,
-                current.createdAt(),
-                updatedAt
-        );
+        if (checkpointService == null) {
+            throw new IllegalStateException(
+                    "terminal checkpoint committer is not configured"
+            );
+        }
         AgentTaskSnapshot saved;
         if (permit == null) {
-            saved = store.save(repaired, current.revision());
+            saved = checkpointService.commitTerminal(
+                    state,
+                    targetStatus,
+                    pendingInterrupt,
+                    current.revision()
+            );
         } else {
-            if (fencedWriter == null) {
-                throw new IllegalStateException(
-                        "fenced checkpoint writer is not configured"
-                );
-            }
-            saved = fencedWriter.save(
-                    repaired,
+            saved = checkpointService.commitTerminal(
+                    state,
+                    targetStatus,
+                    pendingInterrupt,
                     current.revision(),
                     permit
             );
@@ -249,7 +301,9 @@ public final class AgentSnapshotRecoveryService {
     ) {
         String prompt = terminalStep.observationContent();
         if (prompt == null || prompt.isBlank()) {
-            prompt = "Additional user input is required";
+            throw new IllegalStateException(
+                    "clarification output cannot be blank"
+            );
         }
         return new PendingInterrupt(
                 interruptIdSupplier.get(),

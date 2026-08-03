@@ -2,6 +2,7 @@ package com.koawa.agent.agent.checkpoint.resume;
 
 import com.koawa.agent.agent.checkpoint.snapshot.AgentCheckpointStore;
 import com.koawa.agent.agent.checkpoint.snapshot.AgentTaskSnapshotMapper;
+import com.koawa.agent.agent.domain.AgentConversationTurnInput;
 import com.koawa.agent.agent.domain.AgentState;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.PendingInterrupt;
@@ -81,6 +82,12 @@ public final class AgentInterruptConsumptionService {
 
         AgentState state = mapper.toState(current);
         appendUserInput(state, command.userInput());
+        state.setCurrentTurnInput(
+                AgentConversationTurnInput.interruptReply(
+                        command.userInput(),
+                        interrupt.interruptId()
+                )
+        );
         clearPreviousStop(state);
         markConsumedInputBoundary(state, current);
 
@@ -96,6 +103,7 @@ public final class AgentInterruptConsumptionService {
                 next,
                 current.revision()
         );
+        state.setCheckpointRevision(saved.revision());
 
         return new AgentInterruptConsumptionResult(
                 interrupt.interruptId(),

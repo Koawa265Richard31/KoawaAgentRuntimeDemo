@@ -16,7 +16,10 @@ import com.koawa.agent.agent.domain.AgentStep;
 import com.koawa.agent.agent.domain.AgentStopReason;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot;
 import com.koawa.agent.agent.domain.AgentTaskStatus;
+import com.koawa.agent.agent.runtime.InMemoryAgentConversationStore;
+import com.koawa.agent.framework.convention.ChatMessage;
 import org.junit.jupiter.api.Test;
+import org.springframework.transaction.support.TransactionOperations;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -35,11 +38,16 @@ class PersistentAgentCheckpointLifecycleTest {
 
     private final InMemoryAgentCheckpointStore store =
             new InMemoryAgentCheckpointStore();
+    private final InMemoryAgentConversationStore conversationStore =
+            new InMemoryAgentConversationStore();
     private final AgentCheckpointService service =
             new AgentCheckpointService(
                     store,
                     new AgentTaskSnapshotMapper(),
-                    Clock.fixed(NOW, ZoneOffset.UTC));
+                    Clock.fixed(NOW, ZoneOffset.UTC),
+                    null,
+                    conversationStore,
+                    TransactionOperations.withoutTransaction());
     private final PersistentAgentCheckpointLifecycle lifecycle =
             new PersistentAgentCheckpointLifecycle(
                     service,
@@ -65,20 +73,39 @@ class PersistentAgentCheckpointLifecycleTest {
                 AgentTaskStatus.RUNNING,
                 1);
 
+        completeTerminalStep(
+                state,
+                AgentActionType.FINAL_ANSWER,
+                "answer"
+        );
+        lifecycle.stepCommitted(state);
         state.setStopReason(AgentStopReason.FINAL_ANSWER);
         state.setFinalAnswer("answer");
         lifecycle.completed(state);
         assertCheckpoint(
                 "task-1",
-                2,
+                3,
                 AgentTaskStatus.COMPLETED,
-                1);
+                2);
+        assertEquals(
+                List.of(
+                        ChatMessage.user("question"),
+                        ChatMessage.assistant("answer")
+                ),
+                conversationStore.load("conversation-1", "user-1")
+        );
     }
 
     @Test
     void shouldPersistClarificationAsWaitingInputWithInterrupt() {
         AgentState state = state("task-2");
         lifecycle.initialize(state);
+        completeTerminalStep(
+                state,
+                AgentActionType.ASK_CLARIFICATION,
+                "Which order?"
+        );
+        lifecycle.stepCommitted(state);
         state.setStopReason(AgentStopReason.ASK_CLARIFICATION);
         state.setFinalAnswer("Which order?");
 
@@ -86,7 +113,7 @@ class PersistentAgentCheckpointLifecycleTest {
 
         AgentTaskSnapshot snapshot =
                 store.load("task-2").orElseThrow();
-        assertEquals(1, snapshot.revision());
+        assertEquals(2, snapshot.revision());
         assertEquals(
                 AgentTaskStatus.WAITING_FOR_INPUT,
                 snapshot.status());
@@ -96,6 +123,13 @@ class PersistentAgentCheckpointLifecycleTest {
         assertEquals(
                 "Which order?",
                 snapshot.pendingInterrupt().prompt());
+        assertEquals(
+                List.of(
+                        ChatMessage.user("question"),
+                        ChatMessage.assistant("Which order?")
+                ),
+                conversationStore.load("conversation-1", "user-1")
+        );
     }
 
     @Test
@@ -116,6 +150,10 @@ class PersistentAgentCheckpointLifecycleTest {
             String taskId = "terminal-task-" + index++;
             AgentState state = state(taskId);
             lifecycle.initialize(state);
+            if (entry.getKey() == AgentStopReason.ERROR) {
+                // Planning recovery can advance after the last persisted Step.
+                state.setPlanningRecoveryAttempts(1);
+            }
             state.setStopReason(entry.getKey());
 
             lifecycle.completed(state);
@@ -211,22 +249,34 @@ class PersistentAgentCheckpointLifecycleTest {
     }
 
     private void completeOneStep(AgentState state) {
+        completeTerminalStep(
+                state,
+                AgentActionType.CALL_MCP_TOOL,
+                "result"
+        );
+    }
+
+    private void completeTerminalStep(
+            AgentState state,
+            AgentActionType actionType,
+            String content
+    ) {
         AgentAction action = AgentAction.builder()
-                .type(AgentActionType.CALL_MCP_TOOL)
-                .thought("call tool")
+                .type(actionType)
+                .thought("execute step")
                 .arguments(Map.of())
                 .build();
         AgentObservation observation = AgentObservation.builder()
-                .actionType(AgentActionType.CALL_MCP_TOOL)
-                .content("result")
+                .actionType(actionType)
+                .content(content)
                 .metadata(Map.of())
                 .success(true)
                 .build();
         state.getSteps().add(AgentStep.builder()
-                .stepIndex(0)
+                .stepIndex(state.getCurrentStep())
                 .action(action)
                 .observation(observation)
                 .build());
-        state.setCurrentStep(1);
+        state.setCurrentStep(state.getCurrentStep() + 1);
     }
 }

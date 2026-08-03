@@ -114,7 +114,7 @@ public final class PersistentAgentCheckpointLifecycle
         execute(
                 "save completed run",
                 state,
-                () -> save(
+                () -> commitTerminal(
                         state,
                         status,
                         interrupt));
@@ -134,7 +134,9 @@ public final class PersistentAgentCheckpointLifecycle
     private PendingInterrupt clarificationInterrupt(AgentState state) {
         String prompt = state.getFinalAnswer();
         if (prompt == null || prompt.isBlank()) {
-            prompt = "Additional user input is required";
+            throw new IllegalStateException(
+                    "clarification output cannot be blank"
+            );
         }
         return new PendingInterrupt(
                 interruptIdSupplier.get(),
@@ -142,6 +144,29 @@ public final class PersistentAgentCheckpointLifecycle
                 prompt,
                 Map.of(),
                 clock.instant());
+    }
+
+    private void commitTerminal(
+            AgentState state,
+            AgentTaskStatus status,
+            PendingInterrupt interrupt
+    ) {
+        if (leaseSession == null) {
+            checkpointService.commitTerminal(
+                    state,
+                    status,
+                    interrupt
+            );
+            return;
+        }
+
+        leaseSession.requireActive();
+        checkpointService.commitTerminal(
+                state,
+                status,
+                interrupt,
+                leaseSession.currentPermit()
+        );
     }
 
     private void save(

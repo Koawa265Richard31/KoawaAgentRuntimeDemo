@@ -23,8 +23,11 @@ import com.koawa.agent.agent.domain.AgentTaskSnapshot.PendingInterrupt;
 import com.koawa.agent.agent.domain.AgentTaskSnapshot.StepSnapshot;
 import com.koawa.agent.agent.domain.AgentTaskStatus;
 import com.koawa.agent.agent.exception.AgentExecutionConflictException;
+import com.koawa.agent.agent.runtime.InMemoryAgentConversationStore;
+import com.koawa.agent.framework.convention.ChatMessage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.springframework.transaction.support.TransactionOperations;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -62,6 +65,7 @@ class AgentResumeClaimServiceTest {
     private AgentCheckpointService checkpointService;
     private AgentResumeClaimService claimService;
     private AtomicInteger fencedWrites;
+    private InMemoryAgentConversationStore conversationStore;
 
     @BeforeEach
     void setUp() {
@@ -81,6 +85,7 @@ class AgentResumeClaimServiceTest {
                         clock
                 );
         fencedWrites = new AtomicInteger();
+        conversationStore = new InMemoryAgentConversationStore();
         AgentFencedCheckpointWriter fencedWriter =
                 (snapshot, expectedRevision, permit) -> {
                     fencedWrites.incrementAndGet();
@@ -95,7 +100,9 @@ class AgentResumeClaimServiceTest {
                         checkpointStore,
                         mapper,
                         clock,
-                        fencedWriter
+                        fencedWriter,
+                        conversationStore,
+                        TransactionOperations.withoutTransaction()
                 );
         claimService = new AgentResumeClaimService(
                 new AgentResumeService(checkpointStore),
@@ -109,7 +116,7 @@ class AgentResumeClaimServiceTest {
                         mapper,
                         clock,
                         () -> "recovered-interrupt",
-                        fencedWriter
+                        checkpointService
                 ),
                 leaseStore,
                 checkpointService,
@@ -344,6 +351,13 @@ class AgentResumeClaimServiceTest {
         assertEquals(1, recovered.recovery().snapshot().revision());
         assertEquals(1, fencedWrites.get());
         assertEquals(
+                List.of(
+                        ChatMessage.user("resume task"),
+                        ChatMessage.assistant("done")
+                ),
+                conversationStore.load("conversation-1", "user-1")
+        );
+        assertEquals(
                 NOW,
                 leaseStore.load("terminal-boundary-task")
                         .orElseThrow()
@@ -395,7 +409,7 @@ class AgentResumeClaimServiceTest {
         );
 
         assertEquals(
-                "fenced checkpoint writer is not configured",
+                "terminal checkpoint committer is not configured",
                 failure.getMessage()
         );
         assertEquals(

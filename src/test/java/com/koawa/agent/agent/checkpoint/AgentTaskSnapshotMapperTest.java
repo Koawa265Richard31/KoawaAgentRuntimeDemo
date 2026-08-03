@@ -3,6 +3,7 @@ package com.koawa.agent.agent.checkpoint;
 import com.koawa.agent.agent.checkpoint.snapshot.AgentTaskSnapshotMapper;
 import com.koawa.agent.agent.domain.AgentAction;
 import com.koawa.agent.agent.domain.AgentActionType;
+import com.koawa.agent.agent.domain.AgentConversationTurnInput;
 import com.koawa.agent.agent.domain.AgentFailureType;
 import com.koawa.agent.agent.domain.AgentObservation;
 import com.koawa.agent.agent.domain.AgentState;
@@ -56,6 +57,11 @@ class AgentTaskSnapshotMapperTest {
         assertEquals(original.getTaskId(), restored.getTaskId());
         assertEquals(original.getUserId(), restored.getUserId());
         assertEquals(original.getOriginalQuestion(), restored.getOriginalQuestion());
+        assertEquals(
+                original.getCurrentTurnInput(),
+                restored.getCurrentTurnInput()
+        );
+        assertEquals(3, restored.getCheckpointRevision());
         assertEquals(original.getCurrentStep(), restored.getCurrentStep());
         assertEquals(original.getMaxSteps(), restored.getMaxSteps());
         assertEquals(original.getDeadlineAt(), restored.getDeadlineAt());
@@ -206,6 +212,66 @@ class AgentTaskSnapshotMapperTest {
                 () -> mapper.toState(snapshot));
     }
 
+    @Test
+    void shouldFallbackOnlyForLegacyUnconsumedInput() {
+        AgentState restored = mapper.toState(emptySnapshot(Map.of()));
+
+        assertEquals(
+                AgentConversationTurnInput.originalQuestion("question"),
+                restored.getCurrentTurnInput()
+        );
+        assertThrows(
+                AgentTaskSnapshotMappingException.class,
+                () -> mapper.toState(emptySnapshot(Map.of(
+                        "consumedUserInputStep",
+                        "0"
+                )))
+        );
+    }
+
+    @Test
+    void shouldRejectPartialCurrentTurnInputContext() {
+        assertThrows(
+                AgentTaskSnapshotMappingException.class,
+                () -> mapper.toState(emptySnapshot(Map.of(
+                        "currentTurnInputType",
+                        "INTERRUPT_REPLY",
+                        "currentTurnInputContent",
+                        "reply"
+                )))
+        );
+        assertThrows(
+                AgentTaskSnapshotMappingException.class,
+                () -> mapper.toState(emptySnapshot(Map.of(
+                        "currentTurnInputContent",
+                        "reply"
+                )))
+        );
+    }
+
+    private AgentTaskSnapshot emptySnapshot(
+            Map<String, String> recoveryContext
+    ) {
+        return new AgentTaskSnapshot(
+                AgentTaskSnapshot.CURRENT_SCHEMA_VERSION,
+                "task-legacy",
+                "conversation-1",
+                "user-1",
+                0,
+                AgentTaskStatus.RUNNING,
+                "question",
+                0,
+                4,
+                DEADLINE_AT,
+                List.of(),
+                List.of(),
+                recoveryContext,
+                null,
+                CREATED_AT,
+                UPDATED_AT
+        );
+    }
+
     private AgentState state() {
         Map<String, Object> arguments = new HashMap<>();
         arguments.put("query", "status");
@@ -229,6 +295,12 @@ class AgentTaskSnapshotMapperTest {
                 .taskId("task-1")
                 .userId("user-1")
                 .originalQuestion("query order")
+                .currentTurnInput(
+                        AgentConversationTurnInput.interruptReply(
+                                "repository-a",
+                                "interrupt-1"
+                        )
+                )
                 .currentStep(1)
                 .maxSteps(4)
                 .deadlineAt(DEADLINE_AT)

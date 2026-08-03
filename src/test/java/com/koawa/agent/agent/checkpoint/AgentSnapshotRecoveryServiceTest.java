@@ -2,11 +2,13 @@ package com.koawa.agent.agent.checkpoint;
 
 import com.koawa.agent.agent.checkpoint.resume.AgentSnapshotRecoveryResult;
 import com.koawa.agent.agent.checkpoint.resume.AgentSnapshotRecoveryService;
+import com.koawa.agent.agent.checkpoint.snapshot.AgentCheckpointService;
 import com.koawa.agent.agent.checkpoint.snapshot.AgentCheckpointStore;
 import com.koawa.agent.agent.checkpoint.snapshot.AgentTaskSnapshotMapper;
 import com.koawa.agent.agent.checkpoint.snapshot.InMemoryAgentCheckpointStore;
 import com.koawa.agent.agent.domain.AgentAction;
 import com.koawa.agent.agent.domain.AgentActionType;
+import com.koawa.agent.agent.domain.AgentConversationTurnInput;
 import com.koawa.agent.agent.domain.AgentObservation;
 import com.koawa.agent.agent.domain.AgentState;
 import com.koawa.agent.agent.domain.AgentStopReason;
@@ -19,7 +21,10 @@ import com.koawa.agent.agent.exception.CheckpointNotFoundException;
 import com.koawa.agent.agent.recovery.AgentRecoveryDecision;
 import com.koawa.agent.agent.runner.AgentCancellationChecker;
 import com.koawa.agent.agent.runner.AgentLoopRunner;
+import com.koawa.agent.agent.runtime.InMemoryAgentConversationStore;
+import com.koawa.agent.framework.convention.ChatMessage;
 import org.junit.jupiter.api.Test;
+import org.springframework.transaction.support.TransactionOperations;
 
 import java.time.Clock;
 import java.time.Instant;
@@ -44,12 +49,26 @@ class AgentSnapshotRecoveryServiceTest {
             new InMemoryAgentCheckpointStore();
     private final AgentTaskSnapshotMapper mapper =
             new AgentTaskSnapshotMapper();
+    private final Clock clock =
+            Clock.fixed(RECOVERED_AT, ZoneOffset.UTC);
+    private final InMemoryAgentConversationStore conversationStore =
+            new InMemoryAgentConversationStore();
+    private final AgentCheckpointService checkpointService =
+            new AgentCheckpointService(
+                    store,
+                    mapper,
+                    clock,
+                    null,
+                    conversationStore,
+                    TransactionOperations.withoutTransaction()
+            );
     private final AgentSnapshotRecoveryService service =
             new AgentSnapshotRecoveryService(
                     store,
                     mapper,
-                    Clock.fixed(RECOVERED_AT, ZoneOffset.UTC),
-                    () -> "interrupt-recovered"
+                    clock,
+                    () -> "interrupt-recovered",
+                    checkpointService
             );
 
     @Test
@@ -170,6 +189,13 @@ class AgentSnapshotRecoveryServiceTest {
                 "final answer",
                 recovered.state().getFinalAnswer()
         );
+        assertEquals(
+                List.of(
+                        ChatMessage.user("resume task"),
+                        ChatMessage.assistant("final answer")
+                ),
+                conversationStore.load("conversation-1", "user-1")
+        );
 
         AgentSnapshotRecoveryResult loadedAgain =
                 service.restore("final-task", 1);
@@ -218,6 +244,13 @@ class AgentSnapshotRecoveryServiceTest {
                 AgentStopReason.ASK_CLARIFICATION,
                 recovered.state().getStopReason()
         );
+        assertEquals(
+                List.of(
+                        ChatMessage.user("resume task"),
+                        ChatMessage.assistant("Which repository?")
+                ),
+                conversationStore.load("conversation-1", "user-1")
+        );
     }
 
     @Test
@@ -240,7 +273,13 @@ class AgentSnapshotRecoveryServiceTest {
                 ),
                 Map.of(
                         "consumedUserInputStep",
-                        "0"
+                        "0",
+                        "currentTurnInputType",
+                        "INTERRUPT_REPLY",
+                        "currentTurnInputContent",
+                        "repository-a",
+                        "currentTurnSourceInterruptId",
+                        "interrupt-1"
                 ),
                 CREATED_AT
         ));
@@ -260,6 +299,20 @@ class AgentSnapshotRecoveryServiceTest {
         assertEquals(
                 "Which branch?",
                 recovered.snapshot().pendingInterrupt().prompt()
+        );
+        assertEquals(
+                AgentConversationTurnInput.interruptReply(
+                        "repository-a",
+                        "interrupt-1"
+                ),
+                recovered.state().getCurrentTurnInput()
+        );
+        assertEquals(
+                List.of(
+                        ChatMessage.user("repository-a"),
+                        ChatMessage.assistant("Which branch?")
+                ),
+                conversationStore.load("conversation-1", "user-1")
         );
     }
 

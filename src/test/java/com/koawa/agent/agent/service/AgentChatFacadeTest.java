@@ -1,13 +1,9 @@
 package com.koawa.agent.agent.service;
 
-import com.koawa.agent.agent.domain.AgentConversationTurn;
-import com.koawa.agent.agent.domain.AgentConversationTurnInput;
 import com.koawa.agent.agent.domain.AgentRunResult;
 import com.koawa.agent.agent.domain.AgentStopReason;
 import com.koawa.agent.agent.runtime.AgentTaskCancellationRegistry;
 import org.junit.jupiter.api.Test;
-import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.EnumSource;
 
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.mockito.Mockito.mock;
@@ -18,25 +14,19 @@ import static org.mockito.Mockito.when;
 class AgentChatFacadeTest {
 
     private final AgentChatService chatService = mock(AgentChatService.class);
-    private final AgentConversationStore conversationStore =
-            mock(AgentConversationStore.class);
     private final AgentTaskCancellationRegistry cancellationRegistry =
             mock(AgentTaskCancellationRegistry.class);
     private final AgentChatFacade facade = new AgentChatFacade(
             chatService,
-            conversationStore,
             cancellationRegistry
     );
 
-    @ParameterizedTest
-    @EnumSource(
-            value = AgentStopReason.class,
-            names = {"FINAL_ANSWER", "ASK_CLARIFICATION"}
-    )
-    void shouldAppendDeliverableTurnThroughStorePort(
-            AgentStopReason stopReason
-    ) {
-        AgentRunResult result = result(stopReason, "deliverable answer");
+    @Test
+    void shouldReturnRunResultWithoutOwningConversationCommit() {
+        AgentRunResult result = result(
+                AgentStopReason.FINAL_ANSWER,
+                "deliverable answer"
+        );
         when(chatService.chat(
                 "question",
                 "requested-conversation",
@@ -52,17 +42,6 @@ class AgentChatFacadeTest {
         );
 
         assertSame(result, actual);
-        verify(conversationStore).appendTurn(new AgentConversationTurn(
-                "actual-conversation",
-                "user-1",
-                "task-1",
-                1,
-                AgentConversationTurnInput.originalQuestion("question"),
-                stopReason == AgentStopReason.FINAL_ANSWER
-                        ? AgentConversationTurn.Outcome.FINAL_ANSWER
-                        : AgentConversationTurn.Outcome.ASK_CLARIFICATION,
-                "deliverable answer"
-        ));
         verify(cancellationRegistry).clear("task-1");
     }
 
@@ -86,7 +65,6 @@ class AgentChatFacadeTest {
                 "user-1"
         );
 
-        verifyNoInteractions(conversationStore);
         verify(cancellationRegistry).clear("task-1");
     }
 
@@ -95,7 +73,7 @@ class AgentChatFacadeTest {
         facade.cancel("task-1");
 
         verify(cancellationRegistry).cancel("task-1");
-        verifyNoInteractions(chatService, conversationStore);
+        verifyNoInteractions(chatService);
     }
 
     private AgentRunResult result(

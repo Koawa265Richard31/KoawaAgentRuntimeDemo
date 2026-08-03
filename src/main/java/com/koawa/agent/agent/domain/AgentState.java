@@ -41,6 +41,16 @@ public class AgentState {
 
     private String originalQuestion;
 
+    /**
+     * User input paired with the next deliverable terminal step.
+     */
+    private AgentConversationTurnInput currentTurnInput;
+
+    /**
+     * Checkpoint revision from which this runtime state was loaded.
+     */
+    private long checkpointRevision;
+
     private int currentStep;
 
     private int maxSteps;
