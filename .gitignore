@@ -5,3 +5,7 @@ target/
 application-local.yaml
 logs/
 *.log
+
+# Local upstream source references; never publish with KoawaAgent.
+/claude-cli-code/
+/codex-cli-code/

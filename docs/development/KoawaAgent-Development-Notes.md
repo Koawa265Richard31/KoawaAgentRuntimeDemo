@@ -4319,3 +4319,223 @@ DataSource/TransactionManager 资源，不能改成 `REQUIRES_NEW`。
 进入 `M0-S5i：真实 PostgreSQL 重启 E2E 与 M0 出口证据收口`。下一切片会重建应用上下文，验证
 terminal recovery、跨 Task 历史加载和 ASK → Resume → FINAL 在进程重启后仍只产生一次 Turn；
 不会提前进入 M1 协议 v2。
+
+## 2026-08-03：M0-S5i 真实 PostgreSQL 重启 E2E 与 M0 出口证据收口
+
+### 本切片结果
+
+本切片没有新增协议、Migration 或生产状态字段。它用同一个 PostgreSQL 16.14 数据库依次启动并
+关闭三套完整 Spring ApplicationContext，证明之前分别通过组件测试的 Checkpoint、Lease、Resume、
+terminal committer 和 Conversation Store 在真实生产 Bean 图中可以跨进程生命周期组合工作。
+
+同时完成两个出口清理：
+
+- `InMemoryAgentConversationStore` 保留为测试/兼容实现，但移除生产 `@Component` 身份；Spring
+  Context 中唯一的 `AgentConversationStore/AgentConversationHistoryLoader` 是
+  `JdbcAgentConversationStore`，不再依赖 `@Primary` 在两个生产 Bean 之间兜底选择。
+- 仓库根 `.gitignore` 精确加入 `/claude-cli-code/` 与 `/codex-cli-code/`。这两个目录是后续最小闭环
+  完成后用于横向比较的上游源码，只保留在本机，不参与 KoawaAgent 编译、暂存或远端上传；目录
+  内容没有被删除或改写。
+
+### 为什么必须真正重建 Spring Context
+
+此前 PostgreSQL 测试重新 new 过 Store/Service，已经能证明 SQL、事务和 fencing，但它没有覆盖
+Spring 实际选择哪个 Bean、Flyway 在第二次启动时是否只 validate/no-op migrate、Hikari/DataSource
+是否被重新创建，以及下一 Task 是否真的注入 JDBC HistoryLoader。
+
+`PostgresAgentRestartE2ETest` 没有使用会缓存 Context 的普通 `@SpringBootTest`，而是三次执行：
+
+```java
+new SpringApplicationBuilder(
+        KoawaAgentApplication.class,
+        RestartE2EConfiguration.class
+)
+        .web(WebApplicationType.NONE)
+        .run(postgresAndScenarioArguments);
+```
+
+三次 Context 使用同一个 Testcontainers PostgreSQL JDBC URL，但每次取得的 DataSource 对象都不同；
+只在第一次启动前 clean 数据库，Context A、B、C 之间不清库、不换容器，也不复用旧 Service Bean。
+测试配置只用确定性 `LLMService` 替换真实网络请求，主路径仍实际经过当前的
+`LlmAgentPlanner → AgentActionParser → Handler → Runner`，没有提前实现 M1。
+
+### Context A：制造真实 terminal crash boundary
+
+测试先调用生产 Lifecycle 初始化 Task，再运行 Runner 得到 ASK，但故意不调用 `completed`：
+
+```text
+initialize                         → revision 0 / RUNNING
+ASK Step committed                → revision 1 / RUNNING
+进程退出前未进入 terminal commit  → 0 Head / 0 Turn
+```
+
+数据库此时已经有完整 Step 0：`ASK_CLARIFICATION / Which repository?`，但 Task 仍为 RUNNING，
+pendingInterrupt 也尚未生成。这正是“Step 落库后、terminal transaction 前退出”的崩溃窗口。
+
+### Context B：repair、Interrupt 消费和 Resume
+
+新的 Context 使用生产 `AgentResumeExecutionService` 对 revision 1 Resume。Claim 获得 Lease 后，
+Recovery 从已保存 Step 修复终态，不重新调用 Planner 或 Handler：
+
+```text
+revision 1  RUNNING + terminal ASK Step
+    ↓ recovery terminal transaction
+revision 2  WAITING_FOR_INPUT + pendingInterrupt + Turn 1
+    ↓ consume reply(repository-alpha, sourceInterruptId)
+revision 3  RUNNING
+    ↓ FINAL Step committed
+revision 4  RUNNING + terminal FINAL Step
+    ↓ fenced terminal transaction
+revision 5  COMPLETED + Turn 2
+```
+
+Lease acquire、release 和心跳不会修改 Checkpoint revision。对原 revision 1 恢复命令进行响应丢失式
+重试时，CAS 返回 `CheckpointConflictException`；Turn 数和 Head sequence 仍保持 1，调用方必须查询
+revision 2 的权威 Task 状态，而不能期待重新执行 repair。
+
+Context B 最终两行 Turn 是：
+
+```text
+1  task=restart-ask-task  step=0
+   ORIGINAL_QUESTION(Help me choose a repository)
+   → ASK_CLARIFICATION(Which repository?)
+
+2  task=restart-ask-task  step=1
+   INTERRUPT_REPLY(repository-alpha, sourceInterruptId=真实 interruptId)
+   → FINAL_ANSWER(Use repository-alpha.)
+```
+
+### Context C：跨 Task 历史进入真实 Planner 请求
+
+第三套 Context 首先从 JDBC Store 恢复以下四条 oldest-first 消息：
+
+```text
+USER       Help me choose a repository
+ASSISTANT  Which repository?
+USER       repository-alpha
+ASSISTANT  Use repository-alpha.
+```
+
+随后通过生产 `AgentChatFacade` 创建同 conversation/user 的新 Task。测试不只调用 `store.load`，还
+捕获了 `LlmAgentPlanner` 实际交给 LLM 的消息：前四条必须等于旧历史，第五条才是包含
+`What did we choose?` 的当前 Planner Prompt。新 Task 以 revision 2 完成，并增加 Turn 3：
+
+```text
+3  task=restart-follow-up-task  step=0
+   ORIGINAL_QUESTION(What did we choose?)
+   → FINAL_ANSWER(We chose repository-alpha.)
+```
+
+最终数据库逐字段验证 `turn_sequence=1..3`、`taskId + terminalStepIndex`、input/output type、
+sourceInterruptId 和内容；不是只通过消息数量推断正确性。
+
+### 现有 HTTP API 合同证据
+
+新增 `AgentChatControllerTest`，在不改公共协议的前提下固定：
+
+- `POST /api/agent/v1/chat` 的请求转发和 `AgentRunResult` JSON 字段；
+- blank question 返回 `400 VALIDATION_FAILED`，且不调用 Facade；
+- `POST /api/agent/v1/tasks/{taskId}/cancel` 返回空 body 的 `202 Accepted`。
+
+它与已有 Task Query、Resume Controller 测试共同形成“现有 API 无破坏”的 M0 出口证据。
+
+### 测试过程中暴露的测试基础设施问题
+
+第一次编译发现测试嵌套配置类名大小写拼写错误，尚未运行任何场景；修正后保留原断言重跑。
+第一次 Context 启动又发现 `SpringApplicationBuilder.properties(...)` 只是低优先级 default
+properties，会被 `application.yaml` 的默认数据库账号覆盖。测试改用 `.run("--key=value")` 的
+高优先级命令行属性，把 Testcontainers JDBC 地址和凭据传给每一套 Context。
+
+最后一个失败只是测试把持久化 `MessageSnapshot` 与运行态 `ChatMessage` 直接比较。修正方式是通过
+生产 `AgentTaskSnapshotMapper.toState` 恢复后再比较，没有放宽消息内容或顺序断言。这三个失败都
+属于测试脚手架问题，不是持久化数据或生产恢复语义失败。
+
+### 已执行确认
+
+- 最窄目标测试：`AgentChatControllerTest,PostgresAgentRestartE2ETest`，4 tests、0 failure、
+  0 error、0 skipped；重启 E2E 实际使用 PostgreSQL 16.14。
+- M0 相关组合回归包含 Checkpoint、Conversation、Interrupt Consumption、Lease、Resume Claim、
+  terminal recovery、Task/Resume/Chat API，命令退出码 0；全部 PostgreSQL 容器实际启动。
+- 全量命令：`mvn -q "-Dapi.version=1.44" test`。
+- 全量结果：222 tests、0 failure、0 error、0 skipped；53 个 Surefire report 全部通过。
+- 本切片修改 1 个生产文件、2 个测试文件、0 Migration，没有进入 M1 ModelTurn/RunItem/Snapshot v2。
+
+### M0 出口判断
+
+已完成并确认：
+
+- M0-S5i 的真实 Context 重启、terminal repair、ASK → Resume → FINAL、跨 Task History E2E；
+- 真实 revision 序列和 Conversation Turn 顺序；
+- JDBC HistoryLoader 是唯一生产 Conversation Store；
+- Chat/Cancel、Task Query、Resume 的现有 HTTP 合同回归；
+- 全量测试和所有 PostgreSQL 用例在本次命令中 0 skipped。
+
+仍不能宣称整个 M0 已关闭。ADR-003 明确把 `M0-S4a` 延后：当前 Docker Engine 29 / Testcontainers
+1.21.3 组合需要显式 `-Dapi.version=1.44`，普通 `mvn test` 不能保证 PostgreSQL 用例实际执行。
+Execution Plan 的里程碑 Definition of Done 要求所有子切片完成，因此下一步应先独立完成 S4a，
+不能在 S5i 中顺手升级依赖或把手传参数包装成已经闭环。
+
+已知限制继续保留：
+
+- WAITING_FOR_INPUT 期间不会暂停或刷新原始 `deadlineAt`；等待超过 turn timeout 后 Resume 会直接
+  TIMEOUT。本 E2E 配置一小时 timeout 只隔离测试耗时，不代表该产品语义已经裁决。
+- terminal transaction 只保证数据库 Checkpoint/Turn 原子，不提供模型、工具或 HTTP Exactly Once。
+- 旧 v1 consumed-RUNNING Snapshot 缺 CurrentTurnInput source 时仍需部署前排空或迁移。
+- 同一 Conversation 的 Head 只串行 terminal sequence，不禁止两个 Task 基于同一旧历史并行执行。
+- 当前仍是文本 JSON 单 AgentAction；M1-S7 与 M3 入口 Gate 不变。
+
+### 面试问题
+
+#### 问题一：为什么重建 Store 对象不能代替重建 Spring Context？
+
+参考回答：
+
+重新 new Store 只能证明 JDBC 数据仍在。真正重建 Context 还验证 Flyway 二次启动、DataSource 生命周期、
+Bean 选择、事务管理器共享、Resume/Chat 生产接线和 HistoryLoader 注入。重启可靠性是组合属性，不能
+只由单个 Repository 测试推出。
+
+#### 问题二：为什么 terminal repair 不能重新调用 Planner？
+
+参考回答：
+
+terminal Step 的 Action 和 Observation 已经持久化，重新规划可能生成不同输出或重复工具副作用。
+Recovery 应把已提交 Step 投影成缺失的 Task status、Interrupt 和 Conversation Turn。本 E2E 用新
+Context 的 LLM 调用次数为 0 证明 repair 没有重新执行模型。
+
+#### 问题三：ASK 恢复到 FINAL 为什么会从 revision 1 走到 revision 5？
+
+参考回答：
+
+revision 2 修复 ASK terminal；revision 3 一次性消费用户回复；revision 4 保存新的 FINAL Step；
+revision 5 原子提交 COMPLETED Checkpoint 与 FINAL Turn。Lease 心跳不属于业务状态，所以不推进
+revision。每次 revision 都对应一个可解释的持久化边界。
+
+#### 问题四：为什么跨 Task 测试必须检查 Planner 实际收到的消息？
+
+参考回答：
+
+只断言 Store 能 load 历史不能证明 Agent Runtime 使用了它。捕获 Planner 的真实 ChatRequest 可以
+证明 JDBC HistoryLoader 被注入 DefaultAgentChatService，旧 USER/ASSISTANT 消息顺序正确，并且
+当前 Task Prompt 只在历史之后追加。
+
+#### 问题五：为什么 222 个测试全绿后仍不能说 M0 完成？
+
+参考回答：
+
+本次命令依赖手动 Docker API 参数。ADR-003 已把“普通 mvn test 能自然运行 PostgreSQL 用例”定义为
+独立 S4a，并且仍处于延期状态。测试结果证明业务语义在指定环境下通过，但里程碑完成还要求所有
+批准的子切片关闭；工程汇报不能把环境 workaround 当成已完成的自动化门禁。
+
+#### 问题六：等待用户输入为什么会产生 deadline 风险？
+
+参考回答：
+
+deadlineAt 在首次 Chat 创建，Interrupt 消费没有刷新它。如果用户停留超过 turn timeout，Resume
+后的 Runner 会在规划前直接判定 TIMEOUT。是否让等待时间计入预算是产品语义，不应为了测试通过
+偷偷刷新；需要单独比较绝对任务 deadline、执行时间预算和每次 Resume 新预算后再裁决。
+
+### 下一步
+
+执行独立的 `M0-S4a：Testcontainers/Docker Engine 普通测试命令兼容性`。目标是让不附加
+`-Dapi.version=1.44` 的标准 `mvn test` 也实际运行全部 PostgreSQL 测试并保持 0 skipped；完成后再
+根据治理门禁正式判断 M0 是否可以关闭。本轮不开始 M1。

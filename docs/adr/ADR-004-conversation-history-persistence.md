@@ -475,11 +475,35 @@ H2 或 Mock 只可验证组件协议，不得把结果表述为 PostgreSQL 事�
    PostgreSQL 幂等/排序测试。
 2. `M0-S5h`（已完成）：统一 terminal committer，接入初次 Chat、Resume、terminal repair，并完成
    PostgreSQL 事务故障注入测试。
-3. `M0-S5i`：真实 PostgreSQL 重启 E2E、跨 Task 历史验收、README/M0 出口证据收口。
+3. `M0-S5i`（已完成）：真实 PostgreSQL 重启 E2E、跨 Task 历史验收、旧 Chat/Cancel API
+   合同回归与 README/M0 出口证据收口。
 4. `M1-S7`：按 Execution Plan v1.2 完成 canonical v2 主路径、Snapshot/Resume/Conversation adapter、
    typed stream fixture 与 M3 入口 Gate；它不并入 M0 实现提交。
 
 每个切片独立提交；任何 PostgreSQL 用例因 Docker 跳过时必须明确标记“尚未验证”，不能完成 M0。
+
+### M0-S5i 实现证据（2026-08-03）
+
+`PostgresAgentRestartE2ETest` 使用同一个 PostgreSQL 16.14 容器，依次创建并关闭三套完整 Spring
+Context；每套 Context 都拥有新的 Hikari DataSource，运行时只注册 JDBC Conversation Store：
+
+1. Context A 保存 `RUNNING revision 1 + terminal ASK Step` 后故意不调用 `completed` 并退出，
+   此时 Head/Turn 都不存在。
+2. Context B 通过生产 Resume Claim/Recovery 把它修复为 `WAITING_FOR_INPUT revision 2 + Turn 1`，
+   Planner/LLM 调用次数为 0；相同旧 revision 重试被 CAS 拒绝且不增加 Turn。随后消费 Interrupt
+   得到 revision 3，保存 FINAL Step 得到 revision 4，terminal transaction 得到
+   `COMPLETED revision 5 + Turn 2`。
+3. Context C 从同一数据库读取四条有序历史消息，再通过生产 Chat Facade 创建新 Task；Planner
+   请求实际收到旧历史，新 Task 以 `revision 2 + Turn 3` 完成。
+
+数据库最终逐行验证了 `turn_sequence=1..3`、`taskId + terminalStepIndex`、input/output type、
+Interrupt reply 的真实 `sourceInterruptId` 和完整内容。旧 Chat/Cancel HTTP 合同另由
+`AgentChatControllerTest` 覆盖。全量结果为 222 tests、0 failure、0 error、0 skipped，共 53 个
+Surefire report；所有 PostgreSQL/Testcontainers 用例实际执行。
+
+这完成 ADR-004 的重启和跨 Task 证据，但不等于整个 M0 已关闭：ADR-003 明确延期的 `M0-S4a`
+仍需让普通 `mvn test` 无需手传 Docker API 参数即可实际运行 PostgreSQL 测试。等待用户输入是否
+暂停 `deadlineAt` 也仍是显式产品语义待决项，不能由本 E2E 的一小时测试 timeout 代替设计结论。
 
 ## 回滚方案
 

@@ -4,15 +4,12 @@ import com.koawa.agent.agent.domain.AgentConversationTurn;
 import com.koawa.agent.agent.exception.AgentConversationTurnConflictException;
 import com.koawa.agent.agent.service.AgentConversationStore;
 import com.koawa.agent.framework.convention.ChatMessage;
-import org.springframework.stereotype.Component;
-
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 
-@Component
 public final class InMemoryAgentConversationStore
         implements AgentConversationStore {
 
