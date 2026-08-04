@@ -498,12 +498,15 @@ Context；每套 Context 都拥有新的 Hikari DataSource，运行时只注册 
 
 数据库最终逐行验证了 `turn_sequence=1..3`、`taskId + terminalStepIndex`、input/output type、
 Interrupt reply 的真实 `sourceInterruptId` 和完整内容。旧 Chat/Cancel HTTP 合同另由
-`AgentChatControllerTest` 覆盖。全量结果为 222 tests、0 failure、0 error、0 skipped，共 53 个
-Surefire report；所有 PostgreSQL/Testcontainers 用例实际执行。
+`AgentChatControllerTest` 覆盖。当时未先 clean 的报告目录汇总为 222 tests / 53 reports；
+M0-S4a 后续审计确认其中混有两个已删除或已移动测试的 7 个陈旧用例。clean 后当前可信基线是
+215 tests / 51 reports，全部 0 failure、0 error、0 skipped；该纠正不影响 S5i 的 PostgreSQL
+重启断言和真实容器证据。
 
-这完成 ADR-004 的重启和跨 Task 证据，但不等于整个 M0 已关闭：ADR-003 明确延期的 `M0-S4a`
-仍需让普通 `mvn test` 无需手传 Docker API 参数即可实际运行 PostgreSQL 测试。等待用户输入是否
-暂停 `deadlineAt` 也仍是显式产品语义待决项，不能由本 E2E 的一小时测试 timeout 代替设计结论。
+这完成 ADR-004 的重启和跨 Task 证据。ADR-003 延后的 `M0-S4a` 已于 2026-08-04 完成：普通
+`mvn test` 无需手传 Docker API 参数即可实际运行全部 PostgreSQL 测试，因此 M0 的最后一个已知
+出口阻塞项已经关闭。等待用户输入是否暂停 `deadlineAt` 仍是显式产品语义待决项，不能由本 E2E
+的一小时测试 timeout 代替设计结论。
 
 ## 回滚方案
 

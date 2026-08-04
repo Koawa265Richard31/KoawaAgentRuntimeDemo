@@ -4,9 +4,9 @@
 
 Accepted（2026-07-30，项目负责人批准进入 M0-S4 主线实现）
 
-实施顺序调整：项目负责人明确要求暂不处理 Docker/Testcontainers 基础设施，因此
-`M0-S4a` 延后，先实施 `M0-S4b`。这只调整实施顺序，不降低 `M0-S4c` 和 `M0-S4e`
-对真实 PostgreSQL 并发语义的验收要求。
+实施记录：项目负责人曾明确要求暂不处理 Docker/Testcontainers 基础设施，因此先实施
+`M0-S4b`，将 `M0-S4a` 延后；该兼容性切片已于 2026-08-04 完成。M0-S4a 至 M0-S4e
+现均已实现并通过真实 PostgreSQL 验证。
 
 对应范围：
 
@@ -310,20 +310,28 @@ Lease 过期就宣称未知副作用可以安全重放。Fencing 保护内部状
 - 当前 Permit 的 revision CAS + Lease Fence 在同一写语句中成功。
 - PostgreSQL 验证通过前，不宣称并发 Resume 语义已完成。
 
-当前 Docker Engine 29 与项目 Testcontainers 1.21.3 存在 API 兼容问题。已通过临时
-`api.version=1.44` 运行真实 PostgreSQL 测试；正式实现前应在独立兼容性切片升级到已修复
-近期 Docker Engine 兼容性的 Testcontainers 版本，不能依赖开发者永久手传参数。
+`M0-S4a` 已于 2026-08-04 完成。项目从 Spring Boot 3.5.7 默认管理的 Testcontainers 1.21.3
+升级到 1.21.4；[官方发布说明](https://github.com/testcontainers/testcontainers-java/releases/tag/1.21.4)
+明确说明该版本恢复了对近期 Docker Engine 变化的兼容，官方
+[修复提交](https://github.com/testcontainers/testcontainers-java/commit/d6b6ff7) 会优先探测 Docker
+API 1.44，失败时再回退 1.32。
+
+同一普通定向命令的对照结果为：1.21.3 无法完成 Docker 探测，Maven 虽返回成功但 4 个用例全部
+skipped；1.21.4 在不设置 `api.version` 时连接 Docker Desktop Engine 29.6.1，并实际运行
+4 个用例且 0 skipped。随后全部 7 个 PostgreSQL Suite 共 30 个用例，以及 clean 后标准
+`mvn -q test` 的 51 个 Suite / 215 个用例均为 0 failure、0 error、0 skipped。Surefire 报告中
+不存在 `api.version` 系统属性，并记录了 7 次真实 `postgres:16-alpine` 启动。
 
 ## 建议实施切片
 
 ADR 批准后，将 M0-S4 拆为以下独立提交，避免单轮超过 8 个生产文件：
 
-1. `M0-S4a`：修复 Testcontainers/Docker Engine 兼容性，证明普通 `mvn test` 能实际运行
-   PostgreSQL 测试；不改业务语义。
-2. `M0-S4b`：增加 Lease 领域协议、内存 Store 和确定性单元测试；不接 Agent Loop。
-3. `M0-S4c`：增加 Flyway V2、JDBC Lease Store 和 PostgreSQL 并发/过期测试。
-4. `M0-S4d`：接入 Permit-aware Checkpoint Write、心跳与 Lease Lost 停止语义。
-5. `M0-S4e`：组合 Resume Claim 用例，验证两个并发 Resume 只有一个可进入执行阶段。
+1. `M0-S4a`（已完成）：修复 Testcontainers/Docker Engine 兼容性，证明普通 `mvn test` 能实际
+   运行 PostgreSQL 测试；不改业务语义。
+2. `M0-S4b`（已完成）：增加 Lease 领域协议、内存 Store 和确定性单元测试；不接 Agent Loop。
+3. `M0-S4c`（已完成）：增加 Flyway V2、JDBC Lease Store 和 PostgreSQL 并发/过期测试。
+4. `M0-S4d`（已完成）：接入 Permit-aware Checkpoint Write、心跳与 Lease Lost 停止语义。
+5. `M0-S4e`（已完成）：组合 Resume Claim 用例，验证两个并发 Resume 只有一个可进入执行阶段。
 
 每个切片完成后更新开发记录并单独提交。M0-S5 再增加 REST Controller、409 映射和完整
 Resume PostgreSQL E2E。
@@ -336,7 +344,8 @@ Resume PostgreSQL E2E。
 2. 使用可续租 Lease，而不是永久 CAS Claim 或长期数据库锁。
 3. 使用单调 `fencingToken` 保护接管后的 Checkpoint 写入。
 4. 以 30 秒 Lease、10 秒 Renew 作为可配置首版默认值。
-5. 保持 `M0-S4a` 至 `M0-S4e` 的切片边界；当前先实施 `M0-S4b`，`M0-S4a` 延后。
+5. 保持 `M0-S4a` 至 `M0-S4e` 的切片边界；实际顺序为先实施 `M0-S4b`，延后的 `M0-S4a`
+   于 2026-08-04 独立完成，没有把 Docker workaround 混入业务切片。
 
 ## 回滚方案
 

@@ -4539,3 +4539,260 @@ deadlineAt 在首次 Chat 创建，Interrupt 消费没有刷新它。如果用�
 执行独立的 `M0-S4a：Testcontainers/Docker Engine 普通测试命令兼容性`。目标是让不附加
 `-Dapi.version=1.44` 的标准 `mvn test` 也实际运行全部 PostgreSQL 测试并保持 0 skipped；完成后再
 根据治理门禁正式判断 M0 是否可以关闭。本轮不开始 M1。
+
+## 2026-08-04：M0-S4a Testcontainers / Docker Engine 普通测试命令兼容性
+
+### 本切片结果
+
+本切片只修复测试基础设施兼容性，没有修改生产 Java、测试源码、数据库 Migration、Snapshot、
+Lease 或公共 API。`pom.xml` 在 Spring Boot dependency management 上增加一个显式覆盖：
+
+```xml
+<properties>
+    <java.version>17</java.version>
+    <mcp-sdk.version>1.1.2</mcp-sdk.version>
+    <testcontainers.version>1.21.4</testcontainers.version>
+</properties>
+```
+
+升级后，Docker Desktop Engine 29.6.1 下可以只设置 Docker 端点并直接执行：
+
+```powershell
+$env:DOCKER_HOST='npipe:////./pipe/dockerDesktopLinuxEngine'
+mvn -q test
+```
+
+不再需要 `-Dapi.version=1.44`。这关闭了 ADR-003 延后的 M0-S4a，也是 M0 最后一个已知出口
+阻塞项；下一切片可以进入 M1-S1，但本轮没有提前定义或接入 ModelTurn v2。
+
+### 根因：为什么原命令“成功”却没有验证 PostgreSQL
+
+Spring Boot 3.5.7 的 BOM 原本把两个无显式版本的 Testcontainers 依赖管理为 1.21.3：
+
+```text
+org.testcontainers:junit-jupiter:1.21.3
+  └─ org.testcontainers:testcontainers:1.21.3
+       └─ docker-java 3.4.2
+
+org.testcontainers:postgresql:1.21.3
+```
+
+Testcontainers 1.21.3 在没有外部 `api.version` 时使用 Docker API 1.32。当前 Docker Desktop
+29.6.1 的 `docker version` 显示服务端 API 1.55、最低 API 1.40，因此 `/v1.32/info` 被 HTTP 400
+拒绝。此前 Engine 29 的早期版本最低 API 为 1.44，这也是官方问题和项目旧记录中的 1.44 来源；
+无论最低值是 1.40 还是 1.44，1.32 都已经不可用。
+
+项目的 7 个 PostgreSQL 类都使用：
+
+```java
+@Testcontainers(disabledWithoutDocker = true)
+```
+
+所以 Docker 探测失败不会让 Maven 失败，而会把整个测试类转换为 skipped。升级前实际执行同一
+普通定向命令：
+
+```powershell
+mvn -q "-Dtest=PostgresJdbcAgentCheckpointStoreTest" test
+```
+
+结果是 Maven exit code 0，但日志出现 Docker API 400，Surefire 明确记录：
+
+```text
+Tests run: 4, Failures: 0, Errors: 0, Skipped: 4
+```
+
+因此本问题不是“测试跑失败”，而是更危险的“构建看起来成功，但关键数据库语义根本没跑”。只看
+绿色退出码会产生假阳性。
+
+### 版本选择与官方证据
+
+采用 Testcontainers 1.21.4，依据均为官方一手来源：
+
+- [Docker 29 兼容问题 #11212](https://github.com/testcontainers/testcontainers-java/issues/11212)
+  记录了旧 API 被近期 Engine 拒绝的真实错误。
+- [Testcontainers 1.21.4 发布说明](https://github.com/testcontainers/testcontainers-java/releases/tag/1.21.4)
+  明确说明该版本让 1.21.x 适配近期 Docker Engine 变化。
+- [官方修复提交 d6b6ff7](https://github.com/testcontainers/testcontainers-java/commit/d6b6ff7)
+  显示实现先用 API 1.44 ping，失败时回退到 1.32。
+
+这属于已有测试依赖的补丁升级，Testcontainers 仍使用原 MIT 许可，没有引入新的依赖类别或生产
+运行时成本。1.21.4 保留现有 `junit-jupiter`、`postgresql` artifactId 和 Java package，所以 7 个
+测试类无需迁移。
+
+没有采用以下方案：
+
+1. 在 `.mvn/maven.config` 或 Surefire 中固定 `api.version=1.44`。这只是把手传 workaround 藏进
+   仓库，不是依赖本身的兼容修复，也会丢失官方对旧 Engine 的回退能力。
+2. 只升级 docker-java。API 默认值和回退逻辑位于 Testcontainers 的
+   `DockerClientProviderStrategy`，只换传递依赖不能证明修复。
+3. 升级到 Testcontainers 2.x。2.x 也包含修复，但它把模块改为
+   `testcontainers-junit-jupiter` / `testcontainers-postgresql`，并迁移 PostgreSQLContainer 包；
+   本切片会被迫改 `pom.xml + 7` 个测试文件，收益不如 1.21.4 的最小补丁。
+4. 升级整个 Spring Boot。该方案会同时改变大量无关依赖，无法把结果归因于 Docker 兼容性。
+
+### 对照验证
+
+修改后使用与基线完全相同、且不带 `api.version` 的定向命令。日志明确显示：
+
+```text
+Testcontainers version: 1.21.4
+Connected to docker: Server Version 29.6.1 / API Version 1.55
+Container is started (JDBC URL: jdbc:postgresql://...)
+```
+
+对应报告变为：
+
+```text
+Tests run: 4, Failures: 0, Errors: 0, Skipped: 0
+```
+
+随后运行全部 PostgreSQL 测试类：
+
+```powershell
+mvn -q "-Dtest=Postgres*Test" test
+```
+
+精确结果：
+
+| Suite | Tests | Skipped |
+|---|---:|---:|
+| `PostgresJdbcAgentCheckpointStoreTest` | 4 | 0 |
+| `PostgresAgentInterruptConsumptionServiceTest` | 1 | 0 |
+| `PostgresAgentResumeClaimServiceTest` | 1 | 0 |
+| `PostgresAgentSnapshotRecoveryServiceTest` | 5 | 0 |
+| `PostgresJdbcAgentExecutionLeaseStoreTest` | 7 | 0 |
+| `PostgresJdbcAgentConversationStoreTest` | 11 | 0 |
+| `PostgresAgentRestartE2ETest` | 1 | 0 |
+| 合计 | 30 | 0 |
+
+30 个用例全部为 0 failure、0 error，并实际启动 7 个 `postgres:16-alpine` 容器；Flyway 日志确认
+数据库为 PostgreSQL 16.14。
+
+### 为什么最终回归必须先 clean
+
+审计发现 `target/surefire-reports` 之前有 53 个 XML / 222 个 tests，但源码当前只有 51 个 Suite。
+多出的 7 个用例来自两个陈旧报告：
+
+- 已移动旧包名的 `checkpoint.InMemoryAgentExecutionLeaseStoreTest`：6 tests；
+- 已删除的 `RetrieveKbActionHandlerTest`：1 test。
+
+Surefire 的一次定向测试只覆盖本轮运行的报告，不会自动删除其他历史 XML。直接遍历整个目录会把
+旧文件算进“全量结果”，所以 M0-S5i 记录的 222 是当时真实看到的未 clean 汇总，但不是当前可信
+基线；它不影响该切片测试自身的断言，却不能继续作为全量数量证据。
+
+本切片最终先执行：
+
+```powershell
+mvn -q clean
+mvn -q test
+```
+
+第二条就是标准测试命令，不含任何 Docker API 参数。fresh reports 的已执行结果：
+
+```text
+51 suites
+215 tests
+0 failures
+0 errors
+0 skipped
+```
+
+额外核对结果：
+
+- PostgreSQL：7 suites / 30 tests / 0 skipped；
+- 7 份报告中都有真实 PostgreSQL 容器启动记录；
+- 全部 fresh XML 中 `api.version` property 数量为 0；
+- Testcontainers 实际版本为 1.21.4，Docker Engine 为 29.6.1；
+- PostgreSQL 为 16.14，Flyway V1-V3 实际执行。
+
+### 工程性结论
+
+M0-S4a 没有通过“增加更多业务测试”解决问题，而是修复证据链的入口：
+
+```text
+Maven exit code 0
+  ≠ PostgreSQL 语义已验证
+
+可信 Gate
+  = fresh Surefire reports
+  + failures/errors/skipped 都为 0
+  + 精确 PostgreSQL Suite 数与用例数
+  + 真实 container start / PostgreSQL 日志
+  + 未注入 api.version workaround
+```
+
+`disabledWithoutDocker=true` 对没有 Docker 的个人开发环境有用，但 CI 或里程碑验收不能只靠退出码。
+未来可以另设 CI 断言，发现 PostgreSQL Suite skipped 就失败；这不是本切片完成普通命令兼容所需
+的业务改动，留给独立 CI 门禁切片。
+
+### M0 出口判断
+
+已执行并确认：
+
+- M0-S1 至 M0-S5 的 Resume、Interrupt、Lease/Fencing、REST API、terminal transaction、
+  Conversation Store 和真实重启 E2E 已完成；
+- 延后的 M0-S4a 已通过普通 Maven 命令关闭；
+- 当前 fresh 全量回归与全部 PostgreSQL 用例均 0 skipped；
+- 没有改变现有 API、Snapshot schema 或数据库 schema。
+
+因此可以正式标记 M0 完成。以下已知限制不是 M0-S4a 的兼容性阻塞，继续进入后续研究/切片：
+
+- WAITING_FOR_INPUT 是否暂停 `deadlineAt` 尚待单独产品语义裁决；
+- 数据库事务不提供模型、工具和 HTTP 的分布式 Exactly Once；
+- 旧 consumed-RUNNING Snapshot 缺少 CurrentTurnInput source 时仍需排空或迁移；
+- 当前模型主路径仍为文本 JSON 单 `AgentAction`，M1-S7 与 M3 入口 Gate 不变。
+
+### 面试问题
+
+#### 问题一：为什么 Maven 返回 0 仍不能说明 Testcontainers 测试通过？
+
+参考回答：
+
+测试类配置了 `disabledWithoutDocker=true`。Docker API 不兼容时 Testcontainers 把环境判定为不可用，
+JUnit 会 skip 整类而不是失败构建。本项目升级前就是 exit code 0、4 个用例全部 skipped。验收必须
+同时看 fresh Surefire 的 failure/error/skipped 和真实容器启动证据。
+
+#### 问题二：为什么选择 1.21.4，而不是把 api.version 写进 Maven 配置？
+
+参考回答：
+
+1.21.4 是官方为近期 Docker Engine 变化发布的 1.21.x 补丁，先用 API 1.44，失败再回退 1.32。
+固定 Maven 属性只把人工 workaround 隐藏起来，还会把版本策略变成本项目永久维护责任。补丁升级
+保留旧 artifact 和包名，改动只有一行且可归因。
+
+#### 问题三：为什么不直接升级 Testcontainers 2.x？
+
+参考回答：
+
+2.x 会改变模块 artifactId 和 PostgreSQLContainer package，需要修改 7 个测试类；M0-S4a 只解决
+Docker 探测兼容，不应顺带做大版本迁移。1.21.4 已提供同一问题的官方 1.x 修复，风险和移除成本
+更低。大版本升级可以在有独立收益和迁移测试时再做。
+
+#### 问题四：为什么全量测试前要 clean？
+
+参考回答：
+
+Surefire 不会在定向运行时清除其他 Suite 的旧 XML。本项目曾把两个已移动/删除类的 7 个用例重复
+计入，得到 222 而实际 fresh 基线是 215。先 clean 再跑标准命令，才能保证报告集合与本轮源码、
+本轮时间点一致。
+
+#### 问题五：pom 里的一行 testcontainers.version 为什么能同时升级两个依赖？
+
+参考回答：
+
+项目继承 Spring Boot parent，Boot 的 dependency management 通过同名 property 导入
+Testcontainers BOM。子项目覆盖 `testcontainers.version` 后，`junit-jupiter`、`postgresql` 以及
+它们的 Testcontainers 传递模块会解析到同一个 1.21.4，避免逐个依赖写版本导致版本漂移。
+
+#### 问题六：这次实验的控制变量是什么？
+
+参考回答：
+
+前后都使用同一个 Docker Engine、同一个 PostgreSQL 镜像、同一测试类和同一条不带 api.version
+的 Maven 命令；唯一主变量是 Testcontainers 1.21.3 → 1.21.4。结果从 4 skipped 变为 4 实际通过，
+再由 30 个 PostgreSQL 用例和 215 个全量用例验证没有局部偶然性。
+
+### 下一步
+
+进入 `M1-S1：定义 ModelTurn v2 领域协议`。下一切片只新增 provider-neutral 领域类型与不变量测试，
+不修改 `AgentLoopRunner`、不删除 v1 `AgentAction`、不提前实现 Provider Adapter。

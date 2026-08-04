@@ -106,20 +106,22 @@ Content-Type: application/json
 
 - Lease 和 Checkpoint 不为模型、工具或 HTTP 响应提供分布式 Exactly Once。
 - Task 的 `deadlineAt` 当前不会在等待用户输入期间暂停；超过原始 turn timeout 后 Resume 会超时。
-- 当前 Docker Desktop 29 环境运行 PostgreSQL 测试仍需传入 `-Dapi.version=1.44`；普通
-  `mvn test` 的自动兼容属于尚未完成的 `M0-S4a`，因此暂不宣称整个 M0 里程碑已关闭。
+- M0 Checkpoint/Resume 恢复闭环已经完成；Testcontainers 固定为兼容近期 Docker Engine 的
+  `1.21.4`，标准测试命令不再依赖手传 Docker API 版本。
 - 当前模型主路径仍是文本 JSON 单 `AgentAction`；M1 会升级为 Provider 原生 `ModelTurn` 协议。
 
 ## 测试
 
-在当前 Docker Desktop 环境执行包含 PostgreSQL/Testcontainers 的完整回归：
+在 Docker Desktop 环境执行包含 PostgreSQL/Testcontainers 的完整回归：
 
 ```powershell
 $env:DOCKER_HOST='npipe:////./pipe/dockerDesktopLinuxEngine'
-mvn -q "-Dapi.version=1.44" test
+mvn -q clean
+mvn -q test
 ```
 
-PostgreSQL 用例被跳过不能作为 M0 持久化与并发语义通过的证据。
+不需要设置 `api.version`。PostgreSQL 用例被跳过仍不能作为持久化与并发语义通过的证据；验收时
+应先 clean 避免陈旧 Surefire XML 污染统计，并同时核对 Maven 退出码和 `skipped=0`。
 
 ## Docker
 
